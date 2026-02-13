@@ -1,0 +1,44 @@
+{
+  "trade_symbol": "QQQ",
+  "symbols_loaded": [
+    "SPY",
+    "QQQ"
+  ],
+  "knobs": {
+    "trend_fast_span": 12,
+    "trend_slow_span": 48,
+    "trend_in": 0.6,
+    "pullback_z": 1.0,
+    "trend_regime_min": 0.25,
+    "min_event_spacing_bars": 1,
+    "ewma_var_alpha": 0.06,
+    "atr_span": 14,
+    "horizon_intra": 12,
+    "horizon_overn": 10,
+    "tp_mult_intra": 2.0,
+    "sl_mult_intra": 1.5,
+    "tp_mult_overn": 2.2,
+    "sl_mult_overn": 1.6,
+    "same_bar_policy": "close_direction",
+    "spread_half_bps": {
+      "SPY": 0.8,
+      "QQQ": 1.2,
+      "SMH": 1.8
+    },
+    "slip_base_bps": 0.8,
+    "slip_vol_mult": 0.05,
+    "slip_spike_add_bps": 2.0,
+    "vol_spike_q": 0.9,
+    "overnight_slip_add_bps": 1.5,
+    "commission_round_trip_bps": 1.0,
+    "gap_lookback": 120,
+    "include_cross_asset": true,
+    "cross_symbol": "SPY",
+    "drop_rows_with_any_nan_features": true
+  },
+  "notes": {
+    "barrier_touch": "High/Low touch detection; exit at next open; same-bar policy configurable",
+    "spread_model": "half-spread in bps, per symbol (configurable)",
+    "cross_asset": "Optional SPY context merged into QQQ bar features and attached to events"
+  }
+}

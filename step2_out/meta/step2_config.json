@@ -1,4 +1,6 @@
 {
+  "script": "step2_build_events_dataset.py",
+  "version": "2.1.0",
   "trade_symbol": "QQQ",
   "symbols_loaded": [
     "SPY",
@@ -19,7 +21,7 @@
     "sl_mult_intra": 1.5,
     "tp_mult_overn": 2.2,
     "sl_mult_overn": 1.6,
-    "same_bar_policy": "close_direction",
+    "same_bar_policy": "worst",
     "spread_half_bps": {
       "SPY": 0.8,
       "QQQ": 1.2,
@@ -31,14 +33,48 @@
     "vol_spike_q": 0.9,
     "overnight_slip_add_bps": 1.5,
     "commission_round_trip_bps": 1.0,
-    "gap_lookback": 120,
+    "gap_lookback_events": 120,
+    "gap_tail_k": 2.0,
+    "sigma_rank_window": 500,
+    "atr_rank_window": 500,
+    "rank_min_periods": 200,
+    "intraday_tail_window": 200,
+    "intraday_tail_min_periods": 50,
+    "intraday_tail_z": 2.0,
     "include_cross_asset": true,
     "cross_symbol": "SPY",
-    "drop_rows_with_any_nan_features": true
+    "cross_merge_tolerance": "30min",
+    "dropna_core_only": true
   },
   "notes": {
     "barrier_touch": "High/Low touch detection; exit at next open; same-bar policy configurable",
-    "spread_model": "half-spread in bps, per symbol (configurable)",
-    "cross_asset": "Optional SPY context merged into QQQ bar features and attached to events"
+    "gap_features": "Rolling stats computed over gap events only, shifted by 1 event to prevent leakage",
+    "cross_asset": "Optional SPY context merged via merge_asof with tolerance; event-level mapping via t_idx",
+    "nan_policy": "Drops rows only when core features are missing (recommended)"
+  },
+  "outputs": {
+    "bar_features_dir": "C:\\dev\\Coding\\Trading Bot\\adaptive-systematic-trading\\step2_out\\bar_features",
+    "events_path": "C:\\dev\\Coding\\Trading Bot\\adaptive-systematic-trading\\step2_out\\events\\qqq_events.parquet"
+  },
+  "events_summary": {
+    "n_events": 10019,
+    "families": {
+      "trend_long": 9880,
+      "pullback_long": 139
+    },
+    "exit_reasons": {
+      "sl": 4640,
+      "tp": 3899,
+      "horizon": 1480
+    },
+    "y_rate": 0.48937019662640985,
+    "net_mean_bps": -2.2560860853304425,
+    "gross_mean_bps": 6.885347272143061,
+    "cost_mean_bps": 9.141433357473502,
+    "overnight_rate": 0.14292843597165386,
+    "same_bar_ambiguous_rate": 0.0006986725222078052,
+    "tp_to_cost_median": 9.490995079464808,
+    "weekly_events_mean": 19.120229007633586,
+    "weekly_events_p90": 35.0
   }
 }

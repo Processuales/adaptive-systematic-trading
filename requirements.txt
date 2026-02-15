@@ -1,0 +1,6 @@
+pandas
+ib-insync
+matplotlib
+numpy
+pandas-market-calendars
+pyarrow

@@ -173,10 +173,34 @@ def rolling_percentile_last(series: pd.Series, window: int, min_periods: int) ->
     Rolling percentile rank of the current value within its trailing window.
     Returns values in [0, 1].
     """
-    return series.rolling(window, min_periods=min_periods).apply(
-        lambda x: float(np.mean(x <= x[-1])) if np.isfinite(x[-1]) else np.nan,
-        raw=True,
-    )
+    # pandas rolling.rank is vectorized in C and much faster than Python apply.
+    return series.rolling(window, min_periods=min_periods).rank(pct=True)
+
+
+def map_features_from_t_idx(events: pd.DataFrame, source: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    if events.empty or not cols:
+        return events
+    if "t_idx" not in events.columns:
+        return events
+
+    out = events.copy()
+    t_idx = out["t_idx"].to_numpy(dtype=np.int64, copy=False)
+    valid = (t_idx >= 0) & (t_idx < len(source))
+
+    for c in cols:
+        if c not in source.columns:
+            continue
+        src = source[c].to_numpy()
+        if np.issubdtype(src.dtype, np.number) or np.issubdtype(src.dtype, np.bool_):
+            vals = np.full(len(out), np.nan, dtype=float)
+            vals[valid] = src[t_idx[valid]].astype(float, copy=False)
+            out[c] = vals
+        else:
+            vals = np.empty(len(out), dtype=object)
+            vals[:] = np.nan
+            vals[valid] = src[t_idx[valid]]
+            out[c] = vals
+    return out
 
 
 def compute_gap_stats_event_window(
@@ -431,6 +455,25 @@ def friction_cost_return_units(row: pd.Series, sym: str, knobs: Knobs) -> Tuple[
     return spread_half, slip_half, total
 
 
+def friction_cost_from_state(
+    sigma: float,
+    vol_spike: bool,
+    entry_overnight: bool,
+    sym: str,
+    knobs: Knobs,
+) -> Tuple[float, float, float]:
+    spread_half = (knobs.spread_half_bps.get(sym, 1.5)) / 10000.0
+    sigma_v = float(sigma) if np.isfinite(sigma) else 0.0
+    slip_half = (knobs.slip_base_bps / 10000.0) + knobs.slip_vol_mult * sigma_v
+    if vol_spike:
+        slip_half += knobs.slip_spike_add_bps / 10000.0
+    if entry_overnight:
+        slip_half += knobs.overnight_slip_add_bps / 10000.0
+    comm_rt = knobs.commission_round_trip_bps / 10000.0
+    total = 2.0 * (spread_half + slip_half) + comm_rt
+    return spread_half, slip_half, total
+
+
 # -----------------------------
 # Labeling (triple barrier)
 # -----------------------------
@@ -577,39 +620,141 @@ def build_event_dataset(bars: pd.DataFrame, sym: str, knobs: Knobs) -> pd.DataFr
     if cands.empty:
         return pd.DataFrame()
 
+    n = len(bars)
+    open_px = bars["open"].to_numpy(dtype=float)
+    high_px = bars["high"].to_numpy(dtype=float)
+    low_px = bars["low"].to_numpy(dtype=float)
+    close_px = bars["close"].to_numpy(dtype=float)
+    sigma_arr = bars["sigma"].to_numpy(dtype=float)
+    u_atr_arr = bars["u_atr"].to_numpy(dtype=float)
+    vol_spike_arr = bars["vol_spike"].fillna(False).to_numpy(dtype=bool)
+    overnight_arr = bars["entry_overnight"].fillna(False).to_numpy(dtype=bool)
+    date_arr = bars["date"].to_numpy()
+
+    feature_cols = [
+        "trend_score",
+        "pullback_z",
+        "sigma",
+        "u_atr",
+        "vol_z",
+        "dist_to_hi",
+        "gap_mu",
+        "gap_sd",
+        "gap_tail",
+        "range_ratio",
+        "ema_fast_slope",
+        "sigma_prank",
+        "u_atr_prank",
+        "intraday_tail_frac",
+    ]
+    feature_arrays: Dict[str, np.ndarray] = {
+        c: bars[c].to_numpy(dtype=float) if c in bars.columns else np.full(n, np.nan, dtype=float)
+        for c in feature_cols
+    }
+    family_by_t = cands["family"].astype(str).to_dict()
+
     labels: List[Dict] = []
-    for t_idx in cands.index.to_list():
-        lab = label_event_long(bars, t_idx, sym, knobs)
-        if lab is None:
+    for t_idx in cands.index.to_numpy(dtype=np.int64, copy=False):
+        if t_idx + 2 >= n:
             continue
 
-        row_t = bars.iloc[t_idx]
-        lab["family"] = str(cands.loc[t_idx, "family"])
+        entry_i = int(t_idx + 1)
+        entry_open = float(open_px[entry_i])
+        if not np.isfinite(entry_open) or entry_open <= 0:
+            continue
 
-        # Core decision-time features (minimal, stable)
-        core_feats = [
-            "trend_score",
-            "pullback_z",
-            "sigma",
-            "u_atr",
-        ]
-        # Optional, useful features (can be NaN early)
-        opt_feats = [
-            "vol_z",
-            "dist_to_hi",
-            "gap_mu",
-            "gap_sd",
-            "gap_tail",
-            "range_ratio",
-            "ema_fast_slope",
-            "sigma_prank",
-            "u_atr_prank",
-            "intraday_tail_frac",
-        ]
+        overnight = bool(overnight_arr[t_idx])
+        H = int(knobs.horizon_overn if overnight else knobs.horizon_intra)
+        u = float(u_atr_arr[t_idx])
+        if not np.isfinite(u) or u <= 0:
+            continue
 
-        for c in core_feats + opt_feats:
-            lab[c] = float(row_t[c]) if pd.notna(row_t.get(c, np.nan)) else np.nan
+        tp_mult = knobs.tp_mult_overn if overnight else knobs.tp_mult_intra
+        sl_mult = knobs.sl_mult_overn if overnight else knobs.sl_mult_intra
+        a = float(tp_mult * u)
+        b = float(sl_mult * u)
 
+        tp_px = entry_open * np.exp(a)
+        sl_px = entry_open * np.exp(-b)
+        spread_half, slip_half, cost_rt = friction_cost_from_state(
+            sigma=float(sigma_arr[t_idx]),
+            vol_spike=bool(vol_spike_arr[t_idx]),
+            entry_overnight=overnight,
+            sym=sym,
+            knobs=knobs,
+        )
+
+        end_i = min(entry_i + H, n - 2)
+        touch_i: Optional[int] = None
+        touch_side: Optional[str] = None
+        same_bar_ambiguous = 0
+
+        for i in range(entry_i, end_i + 1):
+            hit_tp = high_px[i] >= tp_px
+            hit_sl = low_px[i] <= sl_px
+            if hit_tp and hit_sl:
+                same_bar_ambiguous = 1
+                touch_side = decide_same_bar(
+                    knobs.same_bar_policy,
+                    float(open_px[i]),
+                    float(close_px[i]),
+                )
+                touch_i = int(i)
+                break
+            if hit_tp:
+                touch_side = "tp"
+                touch_i = int(i)
+                break
+            if hit_sl:
+                touch_side = "sl"
+                touch_i = int(i)
+                break
+
+        horizon_capped = int((entry_i + H) > (n - 2))
+        if touch_i is None:
+            exit_i = int(end_i + 1)
+            exit_reason = "horizon"
+            touch_delay_bars = int(min(H, max(1, exit_i - entry_i)))
+        else:
+            exit_i = int(min(touch_i + 1, n - 1))
+            exit_reason = "tp" if touch_side == "tp" else "sl"
+            touch_delay_bars = int(max(1, touch_i - entry_i + 1))
+
+        exit_open = float(open_px[exit_i])
+        if not np.isfinite(exit_open) or exit_open <= 0:
+            continue
+
+        gross = float(np.log(exit_open / entry_open))
+        net = float(gross - cost_rt)
+        lab = {
+            "symbol": sym,
+            "t_idx": int(t_idx),
+            "decision_time_utc": str(date_arr[t_idx]),
+            "entry_time_utc": str(date_arr[entry_i]),
+            "exit_time_utc": str(date_arr[exit_i]),
+            "entry_open": entry_open,
+            "exit_open": exit_open,
+            "entry_overnight": int(overnight),
+            "a_tp": a,
+            "b_sl": b,
+            "H": H,
+            "exit_reason": str(exit_reason),
+            "gross_logret": gross,
+            "cost_rt": float(cost_rt),
+            "net_logret": net,
+            "y": int(net > 0.0),
+            "label_end_idx": exit_i,
+            "truncated_horizon": int(horizon_capped),
+            "touch_delay_bars": touch_delay_bars,
+            "same_bar_ambiguous": int(same_bar_ambiguous),
+            "spread_half": float(spread_half),
+            "slip_half": float(slip_half),
+            "tp_to_cost": float(a / cost_rt) if cost_rt > 0 else np.nan,
+            "family": family_by_t.get(int(t_idx), ""),
+        }
+        for c, arr in feature_arrays.items():
+            v = arr[t_idx]
+            lab[c] = float(v) if np.isfinite(v) else np.nan
         labels.append(lab)
 
     return pd.DataFrame(labels)
@@ -770,12 +915,7 @@ def main() -> None:
             "regime_agree",
         ]
         tb = trade_bars.reset_index(drop=True)
-        for c in desired:
-            if c in tb.columns:
-                # Fix closure capture with default arg binding
-                events[c] = events["t_idx"].map(
-                    lambda i, c=c: tb.loc[int(i), c] if int(i) < len(tb) else np.nan
-                )
+        events = map_features_from_t_idx(events, tb, desired)
 
     # NaN handling: do NOT drop on every optional feature (too aggressive)
     if knobs.dropna_core_only:

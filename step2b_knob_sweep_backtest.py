@@ -109,14 +109,14 @@ def enforce_non_overlap(events: pd.DataFrame) -> pd.DataFrame:
     if events.empty:
         return events.copy()
     df = events.sort_values(["t_idx", "label_end_idx"]).reset_index(drop=True)
+    t_arr = df["t_idx"].to_numpy(dtype=np.int64, copy=False)
+    end_arr = df["label_end_idx"].to_numpy(dtype=np.int64, copy=False)
     keep: List[int] = []
     last_end = -10**9
-    for i, row in df.iterrows():
-        t = int(row["t_idx"])
-        end = int(row["label_end_idx"])
+    for i, (t, end) in enumerate(zip(t_arr, end_arr)):
         if t > last_end:
             keep.append(i)
-            last_end = end
+            last_end = int(end)
     return df.loc[keep].reset_index(drop=True)
 
 
@@ -169,11 +169,35 @@ def summarize_performance(events: pd.DataFrame, start_equity: float = 10_000.0) 
     }
 
 
-def fit_mock_ml_model(train_df: pd.DataFrame, feature_cols: List[str], ridge_alpha: float = 6.0) -> Optional[Dict]:
+def risk_adjusted_score(
+    train_perf: Dict,
+    test_perf: Dict,
+    min_trades_test: int,
+    target_test_trades: int = 0,
+    trade_shortfall_penalty: float = 0.0,
+) -> float:
+    if int(test_perf.get("n") or 0) < min_trades_test:
+        return -1e18
+    end_eq = float(test_perf.get("end_equity") or 0.0)
+    max_dd = float(test_perf.get("max_drawdown")) if test_perf.get("max_drawdown") is not None else 1.0
+    train_edge = float(train_perf.get("net_bps_mean")) if train_perf.get("net_bps_mean") is not None else 0.0
+    test_edge = float(test_perf.get("net_bps_mean")) if test_perf.get("net_bps_mean") is not None else 0.0
+    gap_pen = abs(train_edge - test_edge)
+    n_test = int(test_perf.get("n") or 0)
+    trade_shortfall = max(0, target_test_trades - n_test) if target_test_trades > 0 else 0
+    return end_eq * (1.0 - max_dd) - 40.0 * gap_pen - trade_shortfall_penalty * trade_shortfall
+
+
+def fit_ridge_linear_model(
+    train_df: pd.DataFrame,
+    feature_cols: List[str],
+    target_col: str,
+    ridge_alpha: float,
+) -> Optional[Dict]:
     if len(feature_cols) < 3 or len(train_df) < 80:
         return None
 
-    y = train_df["y"].astype(float).to_numpy()
+    y = train_df[target_col].astype(float).to_numpy()
     med = train_df[feature_cols].median()
     x = train_df[feature_cols].fillna(med).to_numpy(dtype=float)
     mu = x.mean(axis=0)
@@ -193,14 +217,34 @@ def fit_mock_ml_model(train_df: pd.DataFrame, feature_cols: List[str], ridge_alp
 
     return {
         "feature_cols": feature_cols,
+        "target_col": target_col,
         "medians": med.to_dict(),
         "mu": mu.tolist(),
         "sd": sd.tolist(),
         "beta": beta.tolist(),
+        "ridge_alpha": float(ridge_alpha),
     }
 
 
-def predict_mock_ml_prob(df: pd.DataFrame, model: Dict) -> np.ndarray:
+def fit_mock_ml_model(train_df: pd.DataFrame, feature_cols: List[str], ridge_alpha: float = 6.0) -> Optional[Dict]:
+    return fit_ridge_linear_model(
+        train_df=train_df,
+        feature_cols=feature_cols,
+        target_col="y",
+        ridge_alpha=ridge_alpha,
+    )
+
+
+def fit_mock_ml_return_model(train_df: pd.DataFrame, feature_cols: List[str], ridge_alpha: float = 8.0) -> Optional[Dict]:
+    return fit_ridge_linear_model(
+        train_df=train_df,
+        feature_cols=feature_cols,
+        target_col="net_logret",
+        ridge_alpha=ridge_alpha,
+    )
+
+
+def predict_ridge_linear(df: pd.DataFrame, model: Dict) -> np.ndarray:
     cols = model["feature_cols"]
     med = pd.Series(model["medians"])
     x = df[cols].fillna(med).to_numpy(dtype=float)
@@ -209,20 +253,36 @@ def predict_mock_ml_prob(df: pd.DataFrame, model: Dict) -> np.ndarray:
     beta = np.array(model["beta"], dtype=float)
     xs = (x - mu) / sd
     xd = np.column_stack([np.ones(len(xs)), xs])
-    raw = xd @ beta
+    return xd @ beta
+
+
+def predict_mock_ml_prob(df: pd.DataFrame, model: Dict) -> np.ndarray:
+    raw = predict_ridge_linear(df, model)
     p = 1.0 / (1.0 + np.exp(-raw))
     # Shrink toward 0.5 so the simulated ML gate is deliberately conservative.
     p = 0.5 + 0.50 * (p - 0.5)
     return np.clip(p, 1e-4, 1.0 - 1e-4)
 
 
-def score_mock_ml(df: pd.DataFrame, model: Optional[Dict]) -> pd.DataFrame:
-    if model is None or df.empty:
+def score_mock_ml(
+    df: pd.DataFrame,
+    prob_model: Optional[Dict],
+    ret_model: Optional[Dict],
+    ret_mix_weight: float = 0.35,
+) -> pd.DataFrame:
+    if prob_model is None or df.empty:
         return df.iloc[0:0].copy()
     out = df.copy()
-    p = predict_mock_ml_prob(out, model)
-    edge_proxy = p * out["a_tp"].to_numpy() - (1.0 - p) * out["b_sl"].to_numpy() - out["cost_rt"].to_numpy()
+    p = predict_mock_ml_prob(out, prob_model)
+    struct_edge = p * out["a_tp"].to_numpy() - (1.0 - p) * out["b_sl"].to_numpy() - out["cost_rt"].to_numpy()
+    ret_pred = np.zeros(len(out), dtype=float)
+    if ret_model is not None:
+        ret_pred = predict_ridge_linear(out, ret_model)
+    ret_pred = np.clip(ret_pred, -0.02, 0.02)
+    edge_proxy = (1.0 - ret_mix_weight) * struct_edge + ret_mix_weight * ret_pred
     out["ml_prob"] = p
+    out["ml_struct_edge"] = struct_edge
+    out["ml_ret_pred"] = ret_pred
     out["ml_edge_proxy"] = edge_proxy
     return out
 
@@ -232,6 +292,57 @@ def apply_ml_thresholds(df_scored: pd.DataFrame, p_cut: float, edge_cut: float) 
         return df_scored.copy()
     mask = (df_scored["ml_prob"] >= p_cut) & (df_scored["ml_edge_proxy"] >= edge_cut)
     return df_scored[mask].copy()
+
+
+def tune_ml_thresholds(
+    train_scored: pd.DataFrame,
+    min_keep_train: int,
+    target_keep_train: int,
+) -> Tuple[Optional[Dict], pd.DataFrame]:
+    if train_scored.empty:
+        return None, pd.DataFrame()
+
+    p_q_grid = [0.35, 0.45, 0.50, 0.55, 0.60, 0.65]
+    e_q_grid = [0.20, 0.30, 0.40, 0.50, 0.60]
+
+    candidates: List[Dict] = []
+    p_base = train_scored["ml_prob"]
+    e_base = train_scored["ml_edge_proxy"]
+    for pq in p_q_grid:
+        p_cut = float(max(0.49, p_base.quantile(pq)))
+        for eq in e_q_grid:
+            edge_cut = float(e_base.quantile(eq))
+            gated = enforce_non_overlap(apply_ml_thresholds(train_scored, p_cut=p_cut, edge_cut=edge_cut))
+            n = int(len(gated))
+            if n < min_keep_train:
+                continue
+            perf = summarize_performance(gated)
+            edge = float(perf["net_bps_mean"]) if perf["net_bps_mean"] is not None else -1e9
+            dd = float(perf["max_drawdown"]) if perf["max_drawdown"] is not None else 1.0
+            score = edge * np.sqrt(max(n, 1)) - 100.0 * dd - 0.8 * abs(n - target_keep_train)
+            candidates.append(
+                {
+                    "p_cut": p_cut,
+                    "edge_cut": edge_cut,
+                    "train_perf": perf,
+                    "train_n": n,
+                    "tune_score": float(score),
+                    "p_quantile": float(pq),
+                    "edge_quantile": float(eq),
+                }
+            )
+
+    if not candidates:
+        return None, pd.DataFrame()
+    best = max(candidates, key=lambda x: float(x["tune_score"]))
+    best_df = enforce_non_overlap(
+        apply_ml_thresholds(
+            train_scored,
+            p_cut=float(best["p_cut"]),
+            edge_cut=float(best["edge_cut"]),
+        )
+    )
+    return best, best_df
 
 
 def sample_knobs(rng: np.random.Generator) -> s2.Knobs:
@@ -303,11 +414,7 @@ def build_events_from_knobs(
             "regime_agree",
         ]
         tb = trade_bars.reset_index(drop=True)
-        for c in desired:
-            if c in tb.columns:
-                events[c] = events["t_idx"].map(
-                    lambda i, c=c: tb.loc[int(i), c] if int(i) < len(tb) else np.nan
-                )
+        events = s2.map_features_from_t_idx(events, tb, desired)
 
     core = ["trend_score", "pullback_z", "sigma", "u_atr"]
     events = events.dropna(subset=core).reset_index(drop=True)
@@ -375,48 +482,45 @@ def evaluate_trial(
         "entry_overnight",
     ]
     ml_features = [c for c in ml_candidates if c in train_base.columns]
-    model = fit_mock_ml_model(train_base, ml_features, ridge_alpha=6.0)
+    prob_model = fit_mock_ml_model(train_base, ml_features, ridge_alpha=6.0)
+    ret_model = fit_mock_ml_return_model(train_base, ml_features, ridge_alpha=8.0)
     no_ml_train_perf = summarize_performance(no_ml_train)
     no_ml_test_perf = summarize_performance(no_ml_test)
 
     ml_valid = False
     p_cut = None
     edge_cut = None
+    p_quantile = None
+    edge_quantile = None
+    tune_score = None
+    target_keep_train = max(min_trades_train, 70)
     ml_train_perf = summarize_performance(pd.DataFrame())
     ml_test_perf = summarize_performance(pd.DataFrame())
     ml_train = pd.DataFrame()
     ml_test = pd.DataFrame()
 
-    train_scored = score_mock_ml(train_base, model)
-    test_scored = score_mock_ml(test_base, model)
+    train_scored = score_mock_ml(train_base, prob_model=prob_model, ret_model=ret_model, ret_mix_weight=0.35)
+    test_scored = score_mock_ml(test_base, prob_model=prob_model, ret_model=ret_model, ret_mix_weight=0.35)
     if not train_scored.empty and not test_scored.empty:
-        p_cut = float(max(0.51, train_scored["ml_prob"].quantile(0.60)))
-        edge_cut = float(max(0.0, train_scored["ml_edge_proxy"].quantile(0.50)))
-
-        ml_train = enforce_non_overlap(apply_ml_thresholds(train_scored, p_cut=p_cut, edge_cut=edge_cut))
-        ml_test = enforce_non_overlap(apply_ml_thresholds(test_scored, p_cut=p_cut, edge_cut=edge_cut))
-
-        if len(ml_train) < max(40, min_trades_train // 2) or len(ml_test) < min_trades_test:
-            # Relax once to avoid over-pruning.
-            p_cut = float(max(0.50, train_scored["ml_prob"].quantile(0.50)))
-            edge_cut = float(train_scored["ml_edge_proxy"].quantile(0.40))
-            ml_train = enforce_non_overlap(apply_ml_thresholds(train_scored, p_cut=p_cut, edge_cut=edge_cut))
+        min_keep_train = max(35, min_trades_train // 3)
+        best_thr, tuned_train = tune_ml_thresholds(
+            train_scored=train_scored,
+            min_keep_train=min_keep_train,
+            target_keep_train=target_keep_train,
+        )
+        if best_thr is not None:
+            p_cut = float(best_thr["p_cut"])
+            edge_cut = float(best_thr["edge_cut"])
+            p_quantile = float(best_thr["p_quantile"])
+            edge_quantile = float(best_thr["edge_quantile"])
+            tune_score = float(best_thr["tune_score"])
+            ml_train = tuned_train
             ml_test = enforce_non_overlap(apply_ml_thresholds(test_scored, p_cut=p_cut, edge_cut=edge_cut))
 
-        if len(ml_train) >= max(40, min_trades_train // 2) and len(ml_test) >= min_trades_test:
+        if len(ml_train) >= min_keep_train and len(ml_test) >= min_trades_test:
             ml_valid = True
             ml_train_perf = summarize_performance(ml_train)
             ml_test_perf = summarize_performance(ml_test)
-
-    def risk_adjusted_score(train_perf: Dict, test_perf: Dict, min_trades: int) -> float:
-        if int(test_perf["n"]) < min_trades:
-            return -1e18
-        end_eq = float(test_perf["end_equity"])
-        max_dd = float(test_perf["max_drawdown"]) if test_perf["max_drawdown"] is not None else 1.0
-        train_edge = float(train_perf["net_bps_mean"]) if train_perf["net_bps_mean"] is not None else 0.0
-        test_edge = float(test_perf["net_bps_mean"]) if test_perf["net_bps_mean"] is not None else 0.0
-        gap_pen = abs(train_edge - test_edge)
-        return end_eq * (1.0 - max_dd) - 40.0 * gap_pen
 
     return {
         "filter_name": filter_name,
@@ -433,21 +537,40 @@ def evaluate_trial(
         "no_ml": {
             "train": no_ml_train_perf,
             "test": no_ml_test_perf,
-            "score": risk_adjusted_score(no_ml_train_perf, no_ml_test_perf, min_trades_test),
+            "score": risk_adjusted_score(
+                train_perf=no_ml_train_perf,
+                test_perf=no_ml_test_perf,
+                min_trades_test=min_trades_test,
+            ),
         },
         "ml_sim": {
             "model_features": ml_features,
             "p_cut": p_cut,
             "edge_cut": edge_cut,
+            "p_quantile": p_quantile,
+            "edge_quantile": edge_quantile,
+            "threshold_tune_score": tune_score,
+            "target_keep_train": int(target_keep_train),
+            "ret_mix_weight": 0.35,
             "valid": ml_valid,
             "train": ml_train_perf,
             "test": ml_test_perf,
-            "score": risk_adjusted_score(ml_train_perf, ml_test_perf, min_trades_test) if ml_valid else -1e18,
+            "score": (
+                risk_adjusted_score(
+                    train_perf=ml_train_perf,
+                    test_perf=ml_test_perf,
+                    min_trades_test=min_trades_test,
+                    target_test_trades=max(min_trades_test + 10, 35),
+                    trade_shortfall_penalty=80.0,
+                )
+                if ml_valid
+                else -1e18
+            ),
         },
     }
 
 
-def build_full_equity_for_result(
+def build_full_events_for_result(
     result: Dict,
     raw_by_sym: Dict[str, pd.DataFrame],
     symbols: List[str],
@@ -465,6 +588,8 @@ def build_full_equity_for_result(
         knobs=knobs,
     )
     base = apply_policy_filter(events, result["filter_name"])
+    if base.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
     split_bar_idx = int(result["split_bar_idx"])
     train_base, _test_base = split_train_test(base, split_bar_idx)
@@ -472,14 +597,44 @@ def build_full_equity_for_result(
     no_ml_full = enforce_non_overlap(base)
 
     ml_features = result["ml_sim"]["model_features"]
-    model = fit_mock_ml_model(train_base, ml_features, ridge_alpha=6.0)
+    prob_model = fit_mock_ml_model(train_base, ml_features, ridge_alpha=6.0)
+    ret_model = fit_mock_ml_return_model(train_base, ml_features, ridge_alpha=8.0)
     ml_full = pd.DataFrame()
-    if result["ml_sim"].get("valid", False):
+    if (
+        result["ml_sim"].get("valid", False)
+        and result["ml_sim"].get("p_cut") is not None
+        and result["ml_sim"].get("edge_cut") is not None
+    ):
         p_cut = float(result["ml_sim"]["p_cut"])
         edge_cut = float(result["ml_sim"]["edge_cut"])
-        full_scored = score_mock_ml(base, model)
+        ret_mix_weight = float(result["ml_sim"].get("ret_mix_weight", 0.35))
+        full_scored = score_mock_ml(
+            base,
+            prob_model=prob_model,
+            ret_model=ret_model,
+            ret_mix_weight=ret_mix_weight,
+        )
         ml_full = enforce_non_overlap(apply_ml_thresholds(full_scored, p_cut=p_cut, edge_cut=edge_cut))
 
+    return no_ml_full.reset_index(drop=True), ml_full.reset_index(drop=True)
+
+
+def build_full_equity_for_result(
+    result: Dict,
+    raw_by_sym: Dict[str, pd.DataFrame],
+    symbols: List[str],
+    trade_symbol: str,
+    cross_symbol: str,
+    include_cross: bool,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    no_ml_full, ml_full = build_full_events_for_result(
+        result=result,
+        raw_by_sym=raw_by_sym,
+        symbols=symbols,
+        trade_symbol=trade_symbol,
+        cross_symbol=cross_symbol,
+        include_cross=include_cross,
+    )
     return equity_curve(no_ml_full), equity_curve(ml_full)
 
 
@@ -629,7 +784,7 @@ def main() -> None:
             "best_equity_plot": fig_path,
         },
         "notes": {
-            "ml_simulation": "Ridge linear model on train set only; probability shrink + conservative edge gate.",
+            "ml_simulation": "Ridge probability + ridge return head on train set; threshold grid tuned on train only.",
             "overfit_controls": "Chronological split, minimum trade counts, risk-adjusted score, no test-time tuning.",
         },
     }

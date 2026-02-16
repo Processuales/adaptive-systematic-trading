@@ -1,0 +1,1 @@
+{"name":"balanced_default","train_lookback_days":1095,"embargo_days":7,"min_train_events":200,"min_val_events":40,"min_test_events":6,"mix_struct_weight":0.65}

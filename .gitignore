@@ -6,3 +6,6 @@ __pycache__/
 .vscode/
 *.log
 venv/
+step2_out/
+step3_out/
+*.parquet

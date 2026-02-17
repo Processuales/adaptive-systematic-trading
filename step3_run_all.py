@@ -14,7 +14,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "2.0.0"
 
 
 def run_cmd(cmd: list[str], cwd: str) -> None:
@@ -33,6 +33,14 @@ def main() -> None:
     ap.add_argument("--min-val-events", type=int, default=40)
     ap.add_argument("--min-test-events", type=int, default=6)
     ap.add_argument("--mix-struct-weight", type=float, default=0.65)
+    ap.add_argument("--retune-every-folds", type=int, default=3)
+    ap.add_argument("--policy-profile", choices=["balanced", "growth"], default="growth")
+    ap.add_argument("--max-aggressive-size", type=float, default=1.20)
+    ap.add_argument(
+        "--portfolio-allocator",
+        choices=["equal_split", "dynamic_regime", "dynamic_regime_forced"],
+        default="dynamic_regime",
+    )
     args = ap.parse_args()
 
     repo_root = Path(__file__).resolve().parent
@@ -78,6 +86,14 @@ def main() -> None:
             str(args.min_test_events),
             "--mix-struct-weight",
             str(args.mix_struct_weight),
+            "--retune-every-folds",
+            str(args.retune_every_folds),
+            "--policy-profile",
+            str(args.policy_profile),
+            "--max-aggressive-size",
+            str(args.max_aggressive_size),
+            "--portfolio-allocator",
+            str(args.portfolio_allocator),
         ],
         cwd=str(repo_root),
     )

@@ -24,7 +24,7 @@ import pandas as pd
 import step2_build_events_dataset as s2
 import step2b_knob_sweep_backtest as s2b
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 
 
 def ensure_dir(path: str) -> None:
@@ -432,23 +432,23 @@ def plot_portfolio(
     stats_text: str,
     start_capital: float,
 ) -> None:
-    fig, (ax1, ax2) = plt.subplots(
-        2,
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        3,
         1,
-        figsize=(14, 8.5),
-        gridspec_kw={"height_ratios": [3.0, 1.6]},
+        figsize=(15, 10),
+        gridspec_kw={"height_ratios": [3.2, 1.4, 1.1]},
     )
 
-    ax1.plot(eq.index, eq.values, color="#1d3557", linewidth=2.1, label="Dual portfolio equity")
-    ax1.axhline(start_capital, color="black", linewidth=0.8, alpha=0.5)
-    ax1.set_title("SPY + QQQ Dual Portfolio (Walk-Forward Regime Allocation)")
+    ax1.plot(eq.index, eq.values, color="#1d3557", linewidth=2.1, label="Dual portfolio")
+    ax1.axhline(start_capital, color="black", linewidth=0.8, alpha=0.6, linestyle="--", label="Start capital")
+    ax1.set_title("Step 2 Simulation: SPY + QQQ Portfolio (Out-of-Sample Backtest)")
     ax1.set_ylabel("Equity ($)")
-    ax1.grid(alpha=0.25)
+    ax1.grid(alpha=0.22)
 
     ax1b = ax1.twinx()
-    ax1b.plot(weights.index, weights.values, color="#457b9d", linewidth=1.1, alpha=0.45, label="QQQ weight")
+    ax1b.plot(weights.index, weights.values, color="#457b9d", linewidth=1.2, alpha=0.42, label="QQQ weight")
     ax1b.set_ylim(0.0, 1.0)
-    ax1b.set_ylabel("QQQ Weight")
+    ax1b.set_ylabel("QQQ Weight Share")
 
     ax1.text(
         0.01,
@@ -460,15 +460,24 @@ def plot_portfolio(
         fontsize=9,
         bbox={"boxstyle": "round,pad=0.4", "facecolor": "white", "alpha": 0.84, "edgecolor": "#999999"},
     )
+    ax1.legend(loc="lower right", framealpha=0.92)
 
     pnl = monthly["pnl"].to_numpy(dtype=float)
     colors = np.where(pnl >= 0.0, "#2a9d8f", "#d62828")
     ax2.bar(monthly["month_end"], pnl, width=20, color=colors, alpha=0.85)
     ax2.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
-    ax2.set_title("Monthly PnL")
-    ax2.set_ylabel("PnL ($)")
-    ax2.set_xlabel("Time (UTC)")
+    ax2.set_title("Monthly Profit / Loss")
+    ax2.set_ylabel("Monthly PnL ($)")
     ax2.grid(alpha=0.2)
+
+    trades = monthly["trades"].to_numpy(dtype=float)
+    ax3.plot(monthly["month_end"], trades, color="#264653", linewidth=1.4, label="Trades per month")
+    ax3.fill_between(monthly["month_end"], trades, 0.0, color="#264653", alpha=0.12)
+    ax3.set_title("Trading Activity")
+    ax3.set_ylabel("# Trades")
+    ax3.set_xlabel("Time (UTC)")
+    ax3.grid(alpha=0.2)
+    ax3.legend(loc="upper right", framealpha=0.92)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)

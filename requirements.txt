@@ -4,3 +4,5 @@ matplotlib
 numpy
 pandas-market-calendars
 pyarrow
+scikit-learn
+lightgbm

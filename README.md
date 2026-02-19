@@ -12,21 +12,30 @@ Side pairs (like IBIT + ETHA) live under `other-pair/`.
 
 ### Main Pair (SPY + QQQ)
 
-Step 2 simulation chart:
+These charts are generated from the latest run (`generated_utc=2026-02-19`), starting with `$10,000`.
+
+Step 2 simulation chart (avg monthly PnL ≈ `$22`, avg trades/month ≈ `4.4`, end equity ≈ `$12,679`):
 
 ![Step2 SPY QQQ](final%20output/charts/01_step2_ml_simulation_spy_qqq.png)
 
-Step 3 real ML chart:
+Step 3 real ML chart (avg monthly PnL ≈ `$126`, avg trades/month ≈ `6.7`, end equity ≈ `$22,191`):
+
+- Step 3 uses a walk-forward ML stack with two core predictors per symbol:
+  - a classifier for win probability (`P(win)` after costs)
+  - a regressor/quantiles for expected return distribution (used for expected value + sizing)
+- We also run cost stress tests and a block bootstrap to reduce the chance we are just fitting noise.
 
 ![Step3 SPY QQQ](final%20output/charts/02_step3_real_ml_spy_qqq.png)
 
 ### Side Pair Example (IBIT + ETHA)
 
-Step 2 simulation chart:
+This is a side experiment. The overlap history is much shorter, which makes ML less stable.
+
+Step 2 simulation chart (avg monthly PnL ≈ `$25`, end equity ≈ `$10,632`):
 
 ![Step2 IBIT ETHA](other-pair/ibit_etha/final%20output/charts/01_step2_ml_simulation_ibit_etha.png)
 
-Step 3 real ML chart:
+Step 3 real ML chart (avg monthly PnL ≈ `$19`, end equity ≈ `$10,244`):
 
 ![Step3 IBIT ETHA](other-pair/ibit_etha/final%20output/charts/02_step3_real_ml_ibit_etha.png)
 
@@ -42,6 +51,45 @@ Some quant terms used:
 - `drawdown`: how much the strategy drops from a peak.
 - `calmar`: return divided by drawdown (risk-adjusted).
 - `walk-forward`: repeated train/test through time to reduce overfitting.
+
+## How It Works (Slightly More Quant)
+
+### Step 1: Data (IBKR)
+
+- Data source is IBKR historical bars (Interactive Brokers Gateway/TWS).
+- Main pair downloader: `data/scripts/download_history_spy_qqq.py`
+- Side pair downloader example: `other-pair/ibit_etha/scripts/download_history_ibit_etha.py`
+- Expected format is OHLCV bars with a UTC timestamp (`date, open, high, low, close, volume`), saved as `.csv` and/or `.parquet`.
+
+### Step 2: Event Research + Candidate Selection
+
+- We convert bars into an event dataset (profit target / stop loss style outcomes, plus features like trend/volatility/cost proxies).
+- Then we sweep many parameter variations and keep candidates that look good on out-of-sample slices.
+- Output is a dual-portfolio simulation that combines SPY and QQQ (including dynamic weighting rules in the allocator).
+
+Key scripts:
+- Build dataset: `step2_build_events_dataset.py`
+- Diagnostics: `step2_5_analyze_events.py`
+- Sweep + select: `step2_compare_and_select.py`
+- Dual portfolio: `step2_dual_symbol_portfolio_test.py`
+
+### Step 3: Walk-Forward ML + Risk Mode
+
+- Step 3 is “real ML” (not a single backtest fit). It trains and tests repeatedly through time:
+  - train on a rolling lookback window
+  - embargo/purge around split boundaries to reduce leakage
+  - test on the next time segment
+- The model stack is intentionally conservative:
+  - probability calibration (so `P(win)` is closer to reality)
+  - expected value gating (don’t trade unless there is edge after costs)
+  - sizing rules that switch between “safe” and “aggressive” modes
+- Optional: a cross-asset “pattern aid” that uses SPY+QQQ context to nudge probabilities/returns, but it is capped to avoid overfitting.
+
+Key scripts:
+- Build Step 3 dataset: `step3_build_training_dataset.py`
+- Optimize configs: `step3_optimize_model.py`
+- Train + backtest: `step3_train_and_backtest.py`
+- Pattern experiment: `step3_pattern_aid_experiment.py`
 
 ## Project Layout
 

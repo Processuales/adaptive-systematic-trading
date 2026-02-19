@@ -1,11 +1,24 @@
 .venv/
 __pycache__/
+**/__pycache__/
 *.pyc
 .DS_Store
 .idea/
 .vscode/
 *.log
+.pytest_cache/
 venv/
 step2_out/
 step3_out/
 *.parquet
+
+# Side-pair generated artifacts (keep scripts + final summaries/charts)
+other-pair/*/data_clean/
+other-pair/*/data_clean_alias/
+other-pair/*/step2_out/
+other-pair/*/step3_out/
+other-pair/*/data/raw_surrogate_backup/
+other-pair/*/data/raw/
+other-pair/*/final output/step2/
+other-pair/*/final output/step3/
+other-pair/*/final output/dual ml/

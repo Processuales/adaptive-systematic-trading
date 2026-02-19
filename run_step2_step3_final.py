@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-SCRIPT_VERSION = "1.4.0"
+SCRIPT_VERSION = "1.5.0"
 
 
 def ensure_dir(path: str) -> None:
@@ -67,6 +67,24 @@ def load_json(path: Path):
 def as_money(x: float) -> str:
     sign = "-" if x < 0 else ""
     return f"{sign}${abs(float(x)):,.0f}"
+
+
+def safe_tag(text: str, fallback: str = "pair") -> str:
+    s = str(text or "").strip().lower()
+    if not s:
+        return fallback
+    out = []
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch)
+        elif ch in ("-", "_"):
+            out.append("_")
+        else:
+            out.append("_")
+    cleaned = "".join(out).strip("_")
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned or fallback
 
 
 def normalize_monthly(monthly: pd.DataFrame) -> pd.DataFrame:
@@ -156,6 +174,7 @@ def make_step2_chart(
     final_chart_path: Path,
     s2_summary: Dict,
     start_capital: float,
+    display_symbols: tuple[str, str],
 ) -> Dict:
     perf = s2_summary.get("performance", {})
     trades = s2_summary.get("trades", {})
@@ -209,8 +228,8 @@ def make_step2_chart(
     ]
     plot_explainer(
         out_path=final_chart_path,
-        title="Step 2 ML Simulation (Candidate/Policy Simulation)",
-        subtitle="How the dual SPY+QQQ strategy behaved in historical simulation",
+        title=f"Step 2 ML Simulation ({display_symbols[0]} + {display_symbols[1]})",
+        subtitle="Candidate/policy simulation before full walk-forward ML",
         monthly=monthly,
         start_capital=start_capital,
         stats_lines=stats_lines,
@@ -228,6 +247,7 @@ def make_step3_chart(
     s3_summary: Dict,
     monthly_path: Path,
     start_capital: float,
+    display_symbols: tuple[str, str],
 ) -> Dict:
     p = s3_summary.get("portfolio", {})
     perf = p.get("dual_perf", {})
@@ -314,8 +334,8 @@ def make_step3_chart(
     ]
     plot_explainer(
         out_path=final_chart_path,
-        title="Step 3 Real ML Backtest (Walk-Forward Training + Testing)",
-        subtitle="How the trained model performed while adapting SPY+QQQ risk mode",
+        title=f"Step 3 Real ML Backtest ({display_symbols[0]} + {display_symbols[1]})",
+        subtitle="Walk-forward training/testing with risk-mode adaptation",
         monthly=monthly,
         start_capital=start_capital,
         stats_lines=stats_lines,
@@ -359,6 +379,9 @@ def main() -> None:
     ap.add_argument("--step3-max-candidates", type=int, default=6)
     ap.add_argument("--step3-dd-cap", type=float, default=0.12)
     ap.add_argument("--step3-min-trades-month", type=float, default=6.0)
+    ap.add_argument("--pair-tag", default="spy_qqq", help="Slug used in exported chart filenames.")
+    ap.add_argument("--display-symbol-1", default="SPY", help="Display symbol used for chart/report labels.")
+    ap.add_argument("--display-symbol-2", default="QQQ", help="Display symbol used for chart/report labels.")
     ap.add_argument("--run-pattern-experiment", action="store_true", help="Run Step 3 pattern-aid dual-ML comparison.")
     ap.add_argument(
         "--pattern-reuse-existing-runs",
@@ -377,6 +400,8 @@ def main() -> None:
     step2_out = (repo_root / args.step2_out_dir).resolve()
     step3_out = (repo_root / args.step3_out_dir).resolve()
     final_dir = (repo_root / args.final_dir).resolve()
+    pair_tag = safe_tag(args.pair_tag, fallback="pair")
+    display_symbols = (str(args.display_symbol_1).upper(), str(args.display_symbol_2).upper())
 
     if not args.no_clean_final_dir:
         reset_dir(final_dir)
@@ -517,14 +542,20 @@ def main() -> None:
     opt = load_json(step3_opt_src) if step3_opt_src.exists() else {}
     pattern = load_json(pattern_json) if pattern_json.exists() else {}
 
-    step2_chart = charts_dir / "01_step2_ml_simulation_spy_qqq.png"
-    step3_chart = charts_dir / "02_step3_real_ml_spy_qqq.png"
-    step2_snapshot = make_step2_chart(step2_chart, s2_summary=s2, start_capital=args.start_capital)
+    step2_chart = charts_dir / f"01_step2_ml_simulation_{pair_tag}.png"
+    step3_chart = charts_dir / f"02_step3_real_ml_{pair_tag}.png"
+    step2_snapshot = make_step2_chart(
+        step2_chart,
+        s2_summary=s2,
+        start_capital=args.start_capital,
+        display_symbols=display_symbols,
+    )
     step3_snapshot = make_step3_chart(
         step3_chart,
         s3_summary=s3,
         monthly_path=step3_monthly_src,
         start_capital=args.start_capital,
+        display_symbols=display_symbols,
     )
 
     report = {
@@ -533,6 +564,8 @@ def main() -> None:
             "script_version": SCRIPT_VERSION,
             "generated_utc": datetime.now(timezone.utc).isoformat(),
             "start_capital": args.start_capital,
+            "pair_tag": pair_tag,
+            "display_symbols": [display_symbols[0], display_symbols[1]],
             "clean_final_dir": (not args.no_clean_final_dir),
             "prune_step3_temp": (not args.no_prune_step3_temp),
         },

@@ -52,7 +52,7 @@ Some quant terms used:
 - `calmar`: return divided by drawdown (risk-adjusted).
 - `walk-forward`: repeated train/test through time to reduce overfitting.
 
-## How It Works (Slightly More Quant)
+## How It Works 
 
 ### Step 1: Data (IBKR)
 

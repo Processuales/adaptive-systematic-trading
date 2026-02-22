@@ -1,10 +1,16 @@
 Final Output Layout
 
-charts/: human-friendly summary charts for Step 2 and Step 3
+charts/: human-friendly summary charts for SPY+QQQ and Step 4 combined allocators
 step2/: Step 2 raw artifacts (summary JSON + raw strategy chart)
 step3/: Step 3 raw artifacts from optimizer export
-reports/: consolidated machine-readable final summary
 dual ml/: optional pattern-aid ML comparison report
+reports/: consolidated machine-readable summaries
+combined/: SPYQQQ + BTCETH combined artifacts
+  - charts/: combined equity curves and allocator curves
+  - reports/: combined run summaries
+  - data/: combined monthly tables
 
-Use reports/final_output_summary.json for automation and comparisons.
-Main benchmark here is SPY+QQQ. Side pairs live under other-pair/.
+Automation entry points:
+- reports/final_output_summary.json (SPY+QQQ)
+- reports/step4_summary.json (combined absolute best)
+- reports/step4_summary_dynamic.json (combined dynamic best)

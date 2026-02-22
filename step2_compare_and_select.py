@@ -91,6 +91,8 @@ def run_step2b_for_scenario(
     min_trades_train: int,
     min_trades_test: int,
     filters: str,
+    friction_profile: str,
+    market_hours: str,
 ) -> None:
     step2b_path = os.path.join(repo_root, "step2b_knob_sweep_backtest.py")
     sc_out = os.path.join(out_dir, sc.name)
@@ -117,6 +119,10 @@ def run_step2b_for_scenario(
         str(min_trades_train),
         "--min-trades-test",
         str(min_trades_test),
+        "--friction-profile",
+        friction_profile,
+        "--market-hours",
+        market_hours,
     ]
     if not sc.include_cross:
         cmd.append("--no-cross")
@@ -188,6 +194,18 @@ def main() -> None:
         action="store_true",
         help="Skip running Step2b and only aggregate existing scenario summaries",
     )
+    ap.add_argument(
+        "--friction-profile",
+        choices=["equity", "crypto"],
+        default="equity",
+        help="Friction profile for Step2b sweeps.",
+    )
+    ap.add_argument(
+        "--market-hours",
+        choices=["rth", "24_7"],
+        default="rth",
+        help="Market-hours mode for Step2b sweeps.",
+    )
     args = ap.parse_args()
 
     repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -216,6 +234,8 @@ def main() -> None:
                 min_trades_train=args.min_trades_train,
                 min_trades_test=args.min_trades_test,
                 filters=args.filters,
+                friction_profile=args.friction_profile,
+                market_hours=args.market_hours,
             )
 
         if not os.path.exists(summary_path):
@@ -301,6 +321,8 @@ def main() -> None:
             "n_trials_per_scenario": args.n_trials,
             "seed": args.seed,
             "filters_override": args.filters if args.filters.strip() else None,
+            "friction_profile": args.friction_profile,
+            "market_hours": args.market_hours,
         },
         "scenario_summaries": scenario_summaries,
         "best_candidates": {

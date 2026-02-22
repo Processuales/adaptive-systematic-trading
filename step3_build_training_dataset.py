@@ -138,6 +138,18 @@ def main() -> None:
     ap.add_argument("--symbols", nargs="+", default=["SPY", "QQQ"])
     ap.add_argument("--cross-tolerance", default="30min")
     ap.add_argument("--same-bar-policy", choices=["worst", "best", "close_direction"], default="worst")
+    ap.add_argument(
+        "--friction-profile",
+        choices=["equity", "crypto"],
+        default="equity",
+        help="Friction model profile: 'equity' (SPY/QQQ defaults) or 'crypto' (BTC/ETH-calibrated).",
+    )
+    ap.add_argument(
+        "--market-hours",
+        choices=["rth", "24_7"],
+        default="rth",
+        help="Market hours mode: 'rth' for regular trading hours, '24_7' for crypto.",
+    )
     args = ap.parse_args()
 
     out_root = os.path.abspath(args.out_dir)
@@ -148,7 +160,7 @@ def main() -> None:
     if set(symbols) != {"SPY", "QQQ"}:
         raise ValueError("--symbols currently supports exactly SPY and QQQ for Step 3.")
 
-    knobs = s2.default_knobs()
+    knobs = s2.get_knobs_for_profile(args.friction_profile)
     knobs.include_cross_asset = True
     knobs.cross_merge_tolerance = args.cross_tolerance
     knobs.same_bar_policy = args.same_bar_policy
@@ -162,6 +174,13 @@ def main() -> None:
         raw = s2.read_parquet_any(p)
         raw_by_sym[sym] = raw
         bars_by_sym[sym] = s2.compute_bar_features(raw, sym, knobs)
+
+    # For 24/7 markets, disable overnight detection and add weekend flag
+    if args.market_hours == "24_7":
+        for sym in bars_by_sym:
+            bars_by_sym[sym]["entry_overnight"] = False
+            bars_by_sym[sym]["is_weekend"] = bars_by_sym[sym]["date"].dt.dayofweek.isin([5, 6]).astype(int)
+        print("[24/7] Disabled entry_overnight; added is_weekend feature.")
 
     q_events = build_symbol_events(
         bars_by_sym=bars_by_sym,

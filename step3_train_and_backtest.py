@@ -24,7 +24,7 @@ from sklearn.metrics import mean_squared_error
 
 import lightgbm as lgb
 
-SCRIPT_VERSION = "2.4.0"
+SCRIPT_VERSION = "2.5.0"
 
 PATTERN_CONTEXT_COLS = [
     "trend_score",
@@ -48,6 +48,47 @@ PATTERN_CONTEXT_COLS = [
     "beta_proxy",
     "regime_agree",
     "entry_overnight",
+]
+
+# Features below are only known after barrier resolution and leak future info.
+LEAKY_FEATURE_COLS = {
+    "hold_bars",
+    "touch_delay_bars",
+    "same_bar_ambiguous",
+    "truncated_horizon",
+    "y_loss",
+}
+
+REGIME_CONTEXT_COLS = [
+    "trend_score",
+    "pullback_z",
+    "sigma",
+    "u_atr",
+    "vol_z",
+    "dist_to_hi",
+    "range_ratio",
+    "ema_fast_slope",
+    "sigma_prank",
+    "u_atr_prank",
+    "intraday_tail_frac",
+    "is_weekend",
+    "entry_overnight",
+    "tp_to_cost",
+    "ret_spread",
+    "beta_proxy",
+    "regime_agree",
+    "spy_sigma",
+    "spy_u_atr",
+    "spy_trend_score",
+    "spy_pullback_z",
+    "spy_range_ratio",
+    "spy_ema_fast_slope",
+    "qqq_sigma",
+    "qqq_u_atr",
+    "qqq_trend_score",
+    "qqq_pullback_z",
+    "qqq_range_ratio",
+    "qqq_ema_fast_slope",
 ]
 
 
@@ -437,6 +478,128 @@ def confidence_from_predictions(
     return np.clip(conf, 0.0, 1.0)
 
 
+def select_regime_cols(df: pd.DataFrame, candidate_cols: List[str]) -> List[str]:
+    numeric = set(df.select_dtypes(include=[np.number]).columns.tolist())
+    cols: List[str] = []
+    for c in candidate_cols:
+        if c not in df.columns or c not in numeric:
+            continue
+        if c in LEAKY_FEATURE_COLS:
+            continue
+        if df[c].notna().mean() < 0.30:
+            continue
+        sd = float(pd.to_numeric(df[c], errors="coerce").std(ddof=0))
+        if not np.isfinite(sd) or sd <= 1e-9:
+            continue
+        cols.append(c)
+    return sorted(cols)
+
+
+def _forward_window_mean(s: pd.Series, lookahead: int, min_periods: int) -> pd.Series:
+    # Forward mean over next `lookahead` events (excluding current row).
+    return s.shift(-1).rolling(lookahead, min_periods=min_periods).mean().shift(-(lookahead - 1))
+
+
+def fit_regime_classifier(
+    train_df: pd.DataFrame,
+    candidate_cols: List[str],
+    lookahead_events: int,
+    label_quantile: float,
+    min_train_samples: int,
+) -> Dict:
+    cols = select_regime_cols(train_df, candidate_cols)
+    if len(cols) < 6:
+        return {"enabled": False, "reason": "insufficient_regime_features", "selected_cols": cols}
+
+    x = train_df.sort_values("decision_time_utc").reset_index(drop=True).copy()
+    n = len(x)
+    look = int(max(6, lookahead_events))
+    if n < max(min_train_samples, look + 20):
+        return {"enabled": False, "reason": "insufficient_regime_rows", "selected_cols": cols}
+
+    net = pd.to_numeric(x["net_logret"], errors="coerce")
+    win = pd.to_numeric(x["y"], errors="coerce")
+    min_p = int(max(4, 0.7 * look))
+    fwd_ret = _forward_window_mean(net, lookahead=look, min_periods=min_p)
+    fwd_win = _forward_window_mean(win, lookahead=look, min_periods=min_p)
+    regime_score = 10000.0 * fwd_ret + 20.0 * (fwd_win - 0.5)
+
+    valid = regime_score.notna()
+    if int(valid.sum()) < min_train_samples:
+        return {"enabled": False, "reason": "insufficient_regime_labels", "selected_cols": cols}
+
+    q = float(np.clip(label_quantile, 0.45, 0.70))
+    threshold = float(regime_score.loc[valid].quantile(q))
+    regime_y = (regime_score >= threshold).astype(int)
+    train_lab = x.loc[valid, cols].copy()
+    train_lab["regime_y"] = regime_y.loc[valid].astype(int).to_numpy()
+    train_lab = train_lab.dropna(subset=["regime_y"])
+    if len(train_lab) < min_train_samples:
+        return {"enabled": False, "reason": "insufficient_regime_labeled_rows", "selected_cols": cols}
+
+    y_train = train_lab["regime_y"].astype(int).to_numpy()
+    pos_rate = float(np.mean(y_train))
+    if pos_rate < 0.20 or pos_rate > 0.80:
+        return {
+            "enabled": False,
+            "reason": "regime_label_imbalance",
+            "selected_cols": cols,
+            "positive_rate": pos_rate,
+        }
+
+    med = train_lab[cols].median()
+    x_train = train_lab[cols].fillna(med).astype(float)
+    clf = lgb.LGBMClassifier(
+        objective="binary",
+        num_leaves=15,
+        learning_rate=0.04,
+        min_child_samples=24,
+        n_estimators=220,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        reg_alpha=0.0,
+        reg_lambda=0.8,
+        random_state=42,
+        verbosity=-1,
+    )
+    clf.fit(x_train, y_train)
+
+    p_raw = clf.predict_proba(x_train)[:, 1]
+    calib = fit_probability_calibrator(y_train, p_raw)
+    p_cal = apply_probability_calibrator(calib, p_raw)
+    brier = float(np.mean((p_cal - y_train.astype(float)) ** 2))
+
+    return {
+        "enabled": True,
+        "selected_cols": cols,
+        "lookahead_events": look,
+        "label_quantile": q,
+        "threshold": threshold,
+        "medians": med.to_dict(),
+        "model": clf,
+        "calibrator": calib,
+        "n_train": int(len(train_lab)),
+        "positive_rate": pos_rate,
+        "brier_in_sample": brier,
+    }
+
+
+def predict_regime_classifier(df: pd.DataFrame, regime_model: Dict) -> np.ndarray:
+    n = len(df)
+    if n <= 0:
+        return np.array([], dtype=float)
+    if not bool(regime_model.get("enabled")):
+        return np.full(n, 0.5, dtype=float)
+    cols = list(regime_model.get("selected_cols") or [])
+    if not cols:
+        return np.full(n, 0.5, dtype=float)
+    med = pd.Series(regime_model.get("medians") or {})
+    x = df[cols].fillna(med).astype(float)
+    p_raw = regime_model["model"].predict_proba(x)[:, 1]
+    p_cal = apply_probability_calibrator(regime_model.get("calibrator") or {"method": "identity"}, p_raw)
+    return np.clip(np.asarray(p_cal, dtype=float), 1e-4, 1.0 - 1e-4)
+
+
 def select_pattern_cols(df: pd.DataFrame, candidate_cols: List[str]) -> List[str]:
     numeric = set(df.select_dtypes(include=[np.number]).columns.tolist())
     cols: List[str] = []
@@ -757,6 +920,7 @@ def simulate_policy(
     p_pred: np.ndarray,
     ret_pred: np.ndarray,
     params: Dict,
+    regime_prob: Optional[np.ndarray] = None,
 ) -> Tuple[pd.DataFrame, Dict]:
     out = df.copy()
     out["p_pred"] = np.clip(p_pred, 1e-4, 1.0 - 1e-4)
@@ -767,10 +931,28 @@ def simulate_policy(
     mix = float(params["mix_struct_weight"])
     out["ev_final"] = mix * out["ev_struct"] + (1.0 - mix) * out["ret_pred"]
 
+    if regime_prob is None:
+        out["regime_prob"] = 0.5
+    else:
+        rp = np.asarray(regime_prob, dtype=float)
+        if len(rp) != len(out):
+            raise ValueError("regime_prob length must match df rows in simulate_policy.")
+        out["regime_prob"] = np.clip(rp, 1e-4, 1.0 - 1e-4)
+
+    regime_enabled = bool(params.get("regime_enable", False))
+    regime_center = np.clip((out["regime_prob"].to_numpy(dtype=float) - 0.5) * 2.0, -1.0, 1.0)
+    out["regime_scale"] = 1.0
+    if regime_enabled:
+        ev_scale = float(params.get("regime_ev_scale", 0.0))
+        out["ev_final"] = out["ev_final"] + ev_scale * regime_center * out["cost_rt"]
+
     trade = (out["p_pred"] >= float(params["p_cut"])) & (out["ev_final"] >= float(params["ev_cut"]))
     agg = trade & (out["p_pred"] >= float(params["agg_p_cut"])) & (
         out["ev_final"] >= float(params["agg_ev_cut"])
     )
+    if regime_enabled:
+        trade = trade & (out["regime_prob"] >= float(params.get("regime_p_cut", 0.5)))
+        agg = agg & (out["regime_prob"] >= float(params.get("regime_agg_p_cut", 0.6)))
 
     out["trade"] = trade.astype(int)
     out["mode"] = np.where(agg, "aggressive", np.where(trade, "safe", "flat"))
@@ -796,6 +978,16 @@ def simulate_policy(
     else:
         out.loc[safe_mask, "size_mult"] = safe_base
         out.loc[agg_mask, "size_mult"] = agg_base
+    if regime_enabled:
+        reg_size_scale = float(params.get("regime_size_scale", 0.0))
+        reg_min = float(params.get("regime_size_min_mult", 0.60))
+        reg_max = float(params.get("regime_size_max_mult", 1.20))
+        reg_mult = np.clip(1.0 + reg_size_scale * regime_center, reg_min, reg_max)
+        out["regime_scale"] = reg_mult
+        trade_mask_np = trade.to_numpy(dtype=bool)
+        if trade_mask_np.any():
+            cur = out.loc[trade, "size_mult"].to_numpy(dtype=float)
+            out.loc[trade, "size_mult"] = cur * reg_mult[trade_mask_np]
     out["weighted_net_logret"] = out["size_mult"] * out["net_logret"]
 
     traded = out[out["trade"] == 1].copy()
@@ -813,14 +1005,23 @@ def simulate_policy(
     perf["ev_cut"] = float(params["ev_cut"])
     perf["agg_ev_cut"] = float(params["agg_ev_cut"])
     perf["aggressive_size"] = float(params.get("aggressive_size", 1.0))
+    perf["regime_enable"] = bool(params.get("regime_enable", False))
+    perf["regime_p_cut"] = float(params.get("regime_p_cut", 0.5))
+    perf["regime_agg_p_cut"] = float(params.get("regime_agg_p_cut", 0.6))
     return traded, perf
 
 
-def select_feature_cols(df: pd.DataFrame, candidate_cols: List[str]) -> List[str]:
+def select_feature_cols(
+    df: pd.DataFrame,
+    candidate_cols: List[str],
+    exclude_leaky_features: bool = False,
+) -> List[str]:
     cols = [c for c in candidate_cols if c in df.columns]
     numeric = set(df.select_dtypes(include=[np.number]).columns.tolist())
     cols = [c for c in cols if c in numeric]
     cols = [c for c in cols if df[c].notna().mean() >= 0.35]
+    if exclude_leaky_features:
+        cols = [c for c in cols if c not in LEAKY_FEATURE_COLS]
     if len(cols) < 8:
         raise RuntimeError("Too few valid feature columns after NaN filtering.")
     return sorted(cols)
@@ -843,6 +1044,16 @@ def tune_fold(
     pattern_ret_strength: float,
     pattern_prob_max_abs_delta: float,
     pattern_ret_max_abs_delta: float,
+    regime_model_enable: bool,
+    regime_lookahead_events: int,
+    regime_label_quantile: float,
+    regime_min_train_samples: int,
+    regime_p_cut: float,
+    regime_agg_p_cut: float,
+    regime_ev_scale: float,
+    regime_size_scale: float,
+    regime_size_min_mult: float,
+    regime_size_max_mult: float,
 ) -> Tuple[Dict, Dict, List[Dict]]:
     cfg_grid = model_config_grid(policy_profile)
     inner_splits = make_inner_splits(
@@ -892,6 +1103,16 @@ def tune_fold(
                         )
                         p_cal_raw = np.clip(p_cal_raw + p_adj_cal["pattern_prob_delta"], 1e-4, 1.0 - 1e-4)
 
+                regime_model = {"enabled": False}
+                if regime_model_enable:
+                    regime_model = fit_regime_classifier(
+                        train_df=core_train,
+                        candidate_cols=REGIME_CONTEXT_COLS,
+                        lookahead_events=regime_lookahead_events,
+                        label_quantile=regime_label_quantile,
+                        min_train_samples=regime_min_train_samples,
+                    )
+
                 prob_cal = fit_probability_calibrator(
                     y_true=calib_df["y"].to_numpy(dtype=int),
                     p_raw=p_cal_raw,
@@ -921,6 +1142,7 @@ def tune_fold(
                 conf_val = apply_confidence_calibrator(conf_cal, conf_val_raw)
                 val_eval = inner_val.copy()
                 val_eval["confidence"] = conf_val
+                regime_val = predict_regime_classifier(val_eval, regime_model)
 
                 ev_struct = (
                     p_val * val_eval["a_tp"].to_numpy()
@@ -942,8 +1164,21 @@ def tune_fold(
                     "agg_size_floor_mult": 0.82,
                     "agg_size_ceiling_mult": 1.25,
                     "max_aggressive_size": max_aggressive_size,
+                    "regime_enable": bool(regime_model_enable and regime_model.get("enabled", False)),
+                    "regime_p_cut": float(regime_p_cut),
+                    "regime_agg_p_cut": float(max(regime_agg_p_cut, regime_p_cut)),
+                    "regime_ev_scale": float(regime_ev_scale),
+                    "regime_size_scale": float(regime_size_scale),
+                    "regime_size_min_mult": float(regime_size_min_mult),
+                    "regime_size_max_mult": float(regime_size_max_mult),
                 }
-                _tr, perf = simulate_policy(val_eval, p_val, r_val_raw, base_params)
+                _tr, perf = simulate_policy(
+                    val_eval,
+                    p_val,
+                    r_val_raw,
+                    base_params,
+                    regime_prob=regime_val,
+                )
                 perf_s = policy_score(perf, min_trades=max(4, min_val_trades // 2))
                 brier = float(np.mean((p_val - val_eval["y"].to_numpy(dtype=float)) ** 2))
                 rmse = float(
@@ -989,6 +1224,15 @@ def tune_fold(
         calib_outer = fit_df.iloc[-calib_n2:].copy()
 
     tuned_bundle = fit_model_bundle(fit_df, feature_cols, best_cfg)
+    regime_model_outer = {"enabled": False}
+    if regime_model_enable:
+        regime_model_outer = fit_regime_classifier(
+            train_df=fit_df,
+            candidate_cols=REGIME_CONTEXT_COLS,
+            lookahead_events=regime_lookahead_events,
+            label_quantile=regime_label_quantile,
+            min_train_samples=regime_min_train_samples,
+        )
     p_cal_raw, _r_cal_raw, u_cal = predict_model_bundle(calib_outer, tuned_bundle)
     prob_cal = fit_probability_calibrator(calib_outer["y"].to_numpy(dtype=int), p_cal_raw)
     unc_cal = fit_uncertainty_calibrator(u_cal)
@@ -1005,6 +1249,7 @@ def tune_fold(
     conf_val = apply_confidence_calibrator(conf_cal, conf_val_raw)
     tune_eval = tune_outer.copy()
     tune_eval["confidence"] = conf_val
+    regime_val = predict_regime_classifier(tune_eval, regime_model_outer)
     ev_struct = p_val * tune_eval["a_tp"].to_numpy() - (1.0 - p_val) * tune_eval["b_sl"].to_numpy() - tune_eval["cost_rt"].to_numpy()
     ev_final = mix_struct_weight * ev_struct + (1.0 - mix_struct_weight) * np.clip(r_val_raw, -0.03, 0.03)
 
@@ -1050,8 +1295,21 @@ def tune_fold(
                             "agg_size_floor_mult": 0.80,
                             "agg_size_ceiling_mult": 1.28,
                             "max_aggressive_size": float(max_aggressive_size),
+                            "regime_enable": bool(regime_model_enable and regime_model_outer.get("enabled", False)),
+                            "regime_p_cut": float(regime_p_cut),
+                            "regime_agg_p_cut": float(max(regime_agg_p_cut, regime_p_cut)),
+                            "regime_ev_scale": float(regime_ev_scale),
+                            "regime_size_scale": float(regime_size_scale),
+                            "regime_size_min_mult": float(regime_size_min_mult),
+                            "regime_size_max_mult": float(regime_size_max_mult),
                         }
-                        _, perf = simulate_policy(tune_eval, p_val, r_val_raw, params)
+                        _, perf = simulate_policy(
+                            tune_eval,
+                            p_val,
+                            r_val_raw,
+                            params,
+                            regime_prob=regime_val,
+                        )
                         s = policy_score(perf, min_trades=min_val_trades)
                         if s > best_threshold_score:
                             best_threshold_score = s
@@ -1094,6 +1352,16 @@ def train_symbol_walkforward(
     pattern_ret_strength: float,
     pattern_prob_max_abs_delta: float,
     pattern_ret_max_abs_delta: float,
+    regime_model_enable: bool,
+    regime_lookahead_events: int,
+    regime_label_quantile: float,
+    regime_min_train_samples: int,
+    regime_p_cut: float,
+    regime_agg_p_cut: float,
+    regime_ev_scale: float,
+    regime_size_scale: float,
+    regime_size_min_mult: float,
+    regime_size_max_mult: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict], Dict]:
     x = df.copy()
     x["decision_time_utc"] = pd.to_datetime(x["decision_time_utc"], utc=True, errors="coerce")
@@ -1158,6 +1426,16 @@ def train_symbol_walkforward(
                     pattern_ret_strength=pattern_ret_strength,
                     pattern_prob_max_abs_delta=pattern_prob_max_abs_delta,
                     pattern_ret_max_abs_delta=pattern_ret_max_abs_delta,
+                    regime_model_enable=regime_model_enable,
+                    regime_lookahead_events=regime_lookahead_events,
+                    regime_label_quantile=regime_label_quantile,
+                    regime_min_train_samples=regime_min_train_samples,
+                    regime_p_cut=regime_p_cut,
+                    regime_agg_p_cut=regime_agg_p_cut,
+                    regime_ev_scale=regime_ev_scale,
+                    regime_size_scale=regime_size_scale,
+                    regime_size_min_mult=regime_size_min_mult,
+                    regime_size_max_mult=regime_size_max_mult,
                 )
                 active_model_cfg = tuned_cfg
                 active_best_params = tuned_params
@@ -1188,6 +1466,15 @@ def train_symbol_walkforward(
                 min_cluster_samples=pattern_min_cluster_samples,
                 prior_strength=pattern_prior_strength,
                 consistency_tol=pattern_consistency_tol,
+            )
+        regime_model = {"enabled": False}
+        if regime_model_enable:
+            regime_model = fit_regime_classifier(
+                train_df=model_train,
+                candidate_cols=REGIME_CONTEXT_COLS,
+                lookahead_events=regime_lookahead_events,
+                label_quantile=regime_label_quantile,
+                min_train_samples=regime_min_train_samples,
             )
 
         p_cal_raw, _r_cal_raw, u_cal = predict_model_bundle(calib_df, bundle)
@@ -1230,6 +1517,7 @@ def train_symbol_walkforward(
         p_test = apply_probability_calibrator(prob_cal, p_test_raw)
         confidence_test_raw = confidence_from_predictions(p_test, u_test, unc_cal)
         confidence_test = apply_confidence_calibrator(conf_cal, confidence_test_raw)
+        regime_test = predict_regime_classifier(test_df, regime_model)
 
         drift_features = feature_drift_snapshot(train_df, test_df, feature_cols)
         drift_flag, drift_state = performance_drift_flag(fold_rows, drift_features)
@@ -1237,6 +1525,13 @@ def train_symbol_walkforward(
         params_live = dict(active_best_params)
         params_live["use_confidence_sizing"] = True
         params_live["max_aggressive_size"] = float(max_aggressive_size)
+        params_live["regime_enable"] = bool(regime_model_enable and regime_model.get("enabled", False))
+        params_live["regime_p_cut"] = float(regime_p_cut)
+        params_live["regime_agg_p_cut"] = float(max(regime_agg_p_cut, regime_p_cut))
+        params_live["regime_ev_scale"] = float(regime_ev_scale)
+        params_live["regime_size_scale"] = float(regime_size_scale)
+        params_live["regime_size_min_mult"] = float(regime_size_min_mult)
+        params_live["regime_size_max_mult"] = float(regime_size_max_mult)
         if drift_flag:
             # Auto safety mode under drift: tighten entries and reduce leverage.
             params_live["p_cut"] = float(min(0.92, params_live["p_cut"] + 0.02))
@@ -1314,7 +1609,13 @@ def train_symbol_walkforward(
             test_eval["pattern_ret_delta"] = 0.0
             test_eval["pattern_consistency"] = 0.0
             test_eval["pattern_support"] = 0.0
-        traded, fold_perf = simulate_policy(test_eval, p_test, r_test_raw, params_live)
+        traded, fold_perf = simulate_policy(
+            test_eval,
+            p_test,
+            r_test_raw,
+            params_live,
+            regime_prob=regime_test,
+        )
         fold_score = policy_score(fold_perf, min_trades=max(6, min_test_events // 2))
         pattern_active_rate = float((test_eval["pattern_cluster"].to_numpy(dtype=int) >= 0).mean())
         pattern_mean_abs_prob_delta = float(np.mean(np.abs(test_eval["pattern_prob_delta"].to_numpy(dtype=float))))
@@ -1346,6 +1647,8 @@ def train_symbol_walkforward(
         scored = test_eval.copy()
         scored["p_pred"] = p_test
         scored["ret_pred"] = np.clip(r_test_raw, -0.03, 0.03)
+        scored["regime_prob"] = regime_test
+        scored["regime_enabled"] = int(bool(params_live.get("regime_enable", False)))
         scored["drift_flag"] = int(drift_flag)
         scored["feature_drift_mean_abs_z"] = float(drift_features.get("mean_abs_z") or 0.0)
         scored["fold_id"] = fold_id
@@ -1368,6 +1671,10 @@ def train_symbol_walkforward(
         bundle["lgb_ret"].booster_.save_model(ret_path)
         bundle["lgb_q10"].booster_.save_model(q10_path)
         bundle["lgb_q90"].booster_.save_model(q90_path)
+        regime_path = None
+        if bool(regime_model.get("enabled")):
+            regime_path = os.path.join(symbol_dir, f"{fold_id}_regime_lgb_cls.txt")
+            regime_model["model"].booster_.save_model(regime_path)
 
         if prob_cal.get("method") == "isotonic":
             cal_obj = {
@@ -1393,6 +1700,22 @@ def train_symbol_walkforward(
         else:
             conf_cal_obj = {"method": "identity"}
 
+        regime_cal = regime_model.get("calibrator") or {"method": "identity"}
+        if regime_cal.get("method") == "isotonic":
+            regime_cal_obj = {
+                "method": "isotonic",
+                "x_thresholds": [float(v) for v in regime_cal["model"].X_thresholds_],
+                "y_thresholds": [float(v) for v in regime_cal["model"].y_thresholds_],
+            }
+        elif regime_cal.get("method") == "platt":
+            regime_cal_obj = {
+                "method": "platt",
+                "coef": [float(v) for v in regime_cal["model"].coef_.ravel()],
+                "intercept": [float(v) for v in np.atleast_1d(regime_cal["model"].intercept_)],
+            }
+        else:
+            regime_cal_obj = {"method": "identity"}
+
         model_blob = {
             "fold_id": fold_id,
             "symbol": symbol,
@@ -1412,6 +1735,7 @@ def train_symbol_walkforward(
                 "regressor": ret_path,
                 "quantile_q10": q10_path,
                 "quantile_q90": q90_path,
+                "regime_classifier": regime_path,
             },
             "probability_calibration": cal_obj,
             "confidence_calibration": conf_cal_obj,
@@ -1423,6 +1747,25 @@ def train_symbol_walkforward(
                 "performance_drift": drift_state,
             },
             "pattern_aid": pattern_meta,
+            "regime_model": {
+                "enabled": bool(regime_model.get("enabled")),
+                "selected_cols": regime_model.get("selected_cols"),
+                "lookahead_events": regime_model.get("lookahead_events"),
+                "label_quantile": regime_model.get("label_quantile"),
+                "threshold": regime_model.get("threshold"),
+                "n_train": regime_model.get("n_train"),
+                "positive_rate": regime_model.get("positive_rate"),
+                "brier_in_sample": regime_model.get("brier_in_sample"),
+                "calibration": regime_cal_obj,
+                "policy_params": {
+                    "regime_p_cut": float(params_live.get("regime_p_cut", 0.5)),
+                    "regime_agg_p_cut": float(params_live.get("regime_agg_p_cut", 0.6)),
+                    "regime_ev_scale": float(params_live.get("regime_ev_scale", 0.0)),
+                    "regime_size_scale": float(params_live.get("regime_size_scale", 0.0)),
+                    "regime_size_min_mult": float(params_live.get("regime_size_min_mult", 0.6)),
+                    "regime_size_max_mult": float(params_live.get("regime_size_max_mult", 1.2)),
+                },
+            },
             "feature_cols": feature_cols,
         }
         model_path = os.path.join(symbol_dir, f"{fold_id}_model.json")
@@ -1454,6 +1797,11 @@ def train_symbol_walkforward(
                 "pattern_mean_abs_prob_delta": pattern_mean_abs_prob_delta,
                 "pattern_mean_abs_ret_delta": pattern_mean_abs_ret_delta,
                 "pattern_mean_consistency": pattern_mean_consistency,
+                "regime_enabled": bool(params_live.get("regime_enable", False)),
+                "regime_mean_prob": float(np.mean(regime_test)),
+                "regime_trade_pass_rate": float(
+                    np.mean(regime_test >= float(params_live.get("regime_p_cut", 0.5)))
+                ),
                 "nested_selected_cfg": active_model_cfg.get("name"),
                 "model_path": model_path,
             }
@@ -1519,6 +1867,15 @@ def train_symbol_walkforward(
             ),
             "pattern_mean_abs_ret_delta": float(
                 pd.to_numeric(fold_df.get("pattern_mean_abs_ret_delta"), errors="coerce").fillna(0.0).mean()
+            ),
+            "regime_enabled_rate": float(
+                pd.to_numeric(fold_df.get("regime_enabled"), errors="coerce").fillna(0.0).mean()
+            ),
+            "regime_mean_prob": float(
+                pd.to_numeric(fold_df.get("regime_mean_prob"), errors="coerce").fillna(0.5).mean()
+            ),
+            "regime_trade_pass_rate": float(
+                pd.to_numeric(fold_df.get("regime_trade_pass_rate"), errors="coerce").fillna(0.5).mean()
             ),
         },
         "perf": symbol_perf,
@@ -1916,6 +2273,8 @@ def plot_dual(
     out_path: str,
     start_capital: float,
     stats_text: str,
+    symbol_1_label: str = "QQQ",
+    symbol_2_label: str = "SPY",
 ) -> None:
     fig, (ax1, ax2, ax3) = plt.subplots(
         3,
@@ -1924,17 +2283,38 @@ def plot_dual(
         gridspec_kw={"height_ratios": [3.2, 1.4, 1.1]},
     )
     ax1.plot(eq_dual.index, eq_dual.values, color="#1d3557", linewidth=2.2, label="Dual ML portfolio")
-    ax1.plot(eq_q.index, eq_q.values, color="#457b9d", linewidth=1.2, alpha=0.7, label="QQQ model only")
-    ax1.plot(eq_s.index, eq_s.values, color="#2a9d8f", linewidth=1.2, alpha=0.7, label="SPY model only")
+    ax1.plot(
+        eq_q.index,
+        eq_q.values,
+        color="#457b9d",
+        linewidth=1.2,
+        alpha=0.7,
+        label=f"{symbol_1_label} model only",
+    )
+    ax1.plot(
+        eq_s.index,
+        eq_s.values,
+        color="#2a9d8f",
+        linewidth=1.2,
+        alpha=0.7,
+        label=f"{symbol_2_label} model only",
+    )
     ax1.axhline(start_capital, color="black", linewidth=0.8, alpha=0.6, linestyle="--", label="Start capital")
-    ax1.set_title("Step 3 Real ML Backtest: SPY + QQQ")
+    ax1.set_title(f"Step 3 Real ML Backtest: {symbol_2_label} + {symbol_1_label}")
     ax1.set_ylabel("Equity ($)")
     ax1.grid(alpha=0.22)
     ax1.legend()
     ax1b = ax1.twinx()
-    ax1b.plot(q_weight.index, q_weight.values, color="#264653", linewidth=1.1, alpha=0.35, label="QQQ weight")
+    ax1b.plot(
+        q_weight.index,
+        q_weight.values,
+        color="#264653",
+        linewidth=1.1,
+        alpha=0.35,
+        label=f"{symbol_1_label} weight",
+    )
     ax1b.set_ylim(0.0, 1.0)
-    ax1b.set_ylabel("QQQ Weight Share")
+    ax1b.set_ylabel(f"{symbol_1_label} Weight Share")
     ax1.text(
         0.01,
         0.99,
@@ -1973,6 +2353,16 @@ def main() -> None:
     ap.add_argument("--dataset-dir", required=True, help="Path to step3_out/dataset")
     ap.add_argument("--out-dir", required=True, help="Path to step3_out")
     ap.add_argument("--start-capital", type=float, default=10000.0)
+    ap.add_argument(
+        "--display-symbol-1",
+        default="QQQ",
+        help="Display label for the primary sleeve (dataset alias: QQQ).",
+    )
+    ap.add_argument(
+        "--display-symbol-2",
+        default="SPY",
+        help="Display label for the secondary sleeve (dataset alias: SPY).",
+    )
     ap.add_argument("--train-lookback-days", type=int, default=1095)
     ap.add_argument("--embargo-days", type=int, default=7)
     ap.add_argument("--min-train-events", type=int, default=200)
@@ -2061,6 +2451,25 @@ def main() -> None:
     ap.add_argument("--pattern-prob-max-abs-delta", type=float, default=0.04)
     ap.add_argument("--pattern-ret-max-abs-delta", type=float, default=0.0035)
     ap.add_argument(
+        "--exclude-leaky-features",
+        action="store_true",
+        help="Exclude post-outcome features that are not available at decision time.",
+    )
+    ap.add_argument(
+        "--regime-model-enable",
+        action="store_true",
+        help="Enable third-model regime classifier to gate/scale trades.",
+    )
+    ap.add_argument("--regime-lookahead-events", type=int, default=18)
+    ap.add_argument("--regime-label-quantile", type=float, default=0.55)
+    ap.add_argument("--regime-min-train-samples", type=int, default=160)
+    ap.add_argument("--regime-p-cut", type=float, default=0.52)
+    ap.add_argument("--regime-agg-p-cut", type=float, default=0.62)
+    ap.add_argument("--regime-ev-scale", type=float, default=0.80)
+    ap.add_argument("--regime-size-scale", type=float, default=0.30)
+    ap.add_argument("--regime-size-min-mult", type=float, default=0.60)
+    ap.add_argument("--regime-size-max-mult", type=float, default=1.20)
+    ap.add_argument(
         "--cost-stress-multipliers",
         default="1.25,1.50",
         help="Comma-separated cost multipliers for robustness checks (e.g. 1.25,1.50).",
@@ -2100,6 +2509,33 @@ def main() -> None:
         raise ValueError("--pattern-prob-strength/--pattern-ret-strength must be >= 0")
     if args.pattern_prob_max_abs_delta <= 0.0 or args.pattern_ret_max_abs_delta <= 0.0:
         raise ValueError("--pattern-prob-max-abs-delta/--pattern-ret-max-abs-delta must be > 0")
+    if args.regime_lookahead_events < 6 or args.regime_lookahead_events > 96:
+        raise ValueError("--regime-lookahead-events must be in [6, 96]")
+    if args.regime_label_quantile <= 0.0 or args.regime_label_quantile >= 1.0:
+        raise ValueError("--regime-label-quantile must be in (0, 1)")
+    if args.regime_min_train_samples < 80:
+        raise ValueError("--regime-min-train-samples must be >= 80")
+    if args.regime_p_cut <= 0.0 or args.regime_p_cut >= 1.0:
+        raise ValueError("--regime-p-cut must be in (0, 1)")
+    if args.regime_agg_p_cut <= 0.0 or args.regime_agg_p_cut >= 1.0:
+        raise ValueError("--regime-agg-p-cut must be in (0, 1)")
+    if args.regime_agg_p_cut < args.regime_p_cut:
+        raise ValueError("--regime-agg-p-cut must be >= --regime-p-cut")
+    if args.regime_ev_scale < 0.0 or args.regime_ev_scale > 3.0:
+        raise ValueError("--regime-ev-scale must be in [0, 3]")
+    if args.regime_size_scale < 0.0 or args.regime_size_scale > 1.5:
+        raise ValueError("--regime-size-scale must be in [0, 1.5]")
+    if args.regime_size_min_mult <= 0.0 or args.regime_size_max_mult <= 0.0:
+        raise ValueError("--regime-size min/max multipliers must be > 0")
+    if args.regime_size_min_mult > args.regime_size_max_mult:
+        raise ValueError("--regime-size-min-mult must be <= --regime-size-max-mult")
+
+    symbol_1_label = str(args.display_symbol_1 or "").strip().upper()
+    symbol_2_label = str(args.display_symbol_2 or "").strip().upper()
+    if not symbol_1_label or not symbol_2_label:
+        raise ValueError("--display-symbol-1 and --display-symbol-2 must be non-empty")
+    if symbol_1_label == symbol_2_label:
+        raise ValueError("--display-symbol-1 and --display-symbol-2 must be different")
 
     cost_stress_multipliers = sorted({v for v in parse_float_list(args.cost_stress_multipliers) if v > 1.0})
 
@@ -2118,8 +2554,16 @@ def main() -> None:
     feature_candidates = load_meta_features(meta_path)
     q_df = pd.read_parquet(q_path)
     s_df = pd.read_parquet(s_path)
-    q_feats = select_feature_cols(q_df, feature_candidates)
-    s_feats = select_feature_cols(s_df, feature_candidates)
+    q_feats = select_feature_cols(
+        q_df,
+        feature_candidates,
+        exclude_leaky_features=bool(args.exclude_leaky_features),
+    )
+    s_feats = select_feature_cols(
+        s_df,
+        feature_candidates,
+        exclude_leaky_features=bool(args.exclude_leaky_features),
+    )
 
     q_scored, q_trades, q_fold_rows, q_summary = train_symbol_walkforward(
         df=q_df,
@@ -2152,6 +2596,16 @@ def main() -> None:
         pattern_ret_strength=args.pattern_ret_strength,
         pattern_prob_max_abs_delta=args.pattern_prob_max_abs_delta,
         pattern_ret_max_abs_delta=args.pattern_ret_max_abs_delta,
+        regime_model_enable=args.regime_model_enable,
+        regime_lookahead_events=args.regime_lookahead_events,
+        regime_label_quantile=args.regime_label_quantile,
+        regime_min_train_samples=args.regime_min_train_samples,
+        regime_p_cut=args.regime_p_cut,
+        regime_agg_p_cut=args.regime_agg_p_cut,
+        regime_ev_scale=args.regime_ev_scale,
+        regime_size_scale=args.regime_size_scale,
+        regime_size_min_mult=args.regime_size_min_mult,
+        regime_size_max_mult=args.regime_size_max_mult,
     )
     s_scored, s_trades, s_fold_rows, s_summary = train_symbol_walkforward(
         df=s_df,
@@ -2184,6 +2638,16 @@ def main() -> None:
         pattern_ret_strength=args.pattern_ret_strength,
         pattern_prob_max_abs_delta=args.pattern_prob_max_abs_delta,
         pattern_ret_max_abs_delta=args.pattern_ret_max_abs_delta,
+        regime_model_enable=args.regime_model_enable,
+        regime_lookahead_events=args.regime_lookahead_events,
+        regime_label_quantile=args.regime_label_quantile,
+        regime_min_train_samples=args.regime_min_train_samples,
+        regime_p_cut=args.regime_p_cut,
+        regime_agg_p_cut=args.regime_agg_p_cut,
+        regime_ev_scale=args.regime_ev_scale,
+        regime_size_scale=args.regime_size_scale,
+        regime_size_min_mult=args.regime_size_min_mult,
+        regime_size_max_mult=args.regime_size_max_mult,
     )
 
     q_scored_path = os.path.join(backtest_dir, "qqq_scored_events.parquet")
@@ -2328,6 +2792,10 @@ def main() -> None:
     s_pat_rate = float((s_summary.get("fold_stability") or {}).get("pattern_active_rate") or 0.0)
     q_pat_prob = float((q_summary.get("fold_stability") or {}).get("pattern_mean_abs_prob_delta") or 0.0)
     s_pat_prob = float((s_summary.get("fold_stability") or {}).get("pattern_mean_abs_prob_delta") or 0.0)
+    q_regime_rate = float((q_summary.get("fold_stability") or {}).get("regime_trade_pass_rate") or 0.0)
+    s_regime_rate = float((s_summary.get("fold_stability") or {}).get("regime_trade_pass_rate") or 0.0)
+    q_regime_prob = float((q_summary.get("fold_stability") or {}).get("regime_mean_prob") or 0.5)
+    s_regime_prob = float((s_summary.get("fold_stability") or {}).get("regime_mean_prob") or 0.5)
     stress_tests: List[Dict] = []
     for mult in cost_stress_multipliers:
         stress_tests.append(
@@ -2380,8 +2848,11 @@ def main() -> None:
             f"End equity: ${float(perf_dual['end_equity']):,.0f}",
             f"CAGR: {100.0 * float(perf_dual['cagr']):.2f}%  |  Max DD: {100.0 * float(perf_dual['max_drawdown']):.2f}%",
             f"Calmar: {float(perf_dual['calmar']) if perf_dual['calmar'] is not None else float('nan'):.2f}",
-            f"Allocator: {allocator_name}  |  QQQ weight avg/min/max: {q_weight_mean:.2f}/{q_weight_min:.2f}/{q_weight_max:.2f}",
-            f"SPY guard avg/min/max: {spy_guard_mean:.2f}/{spy_guard_min:.2f}/{spy_guard_max:.2f}",
+            (
+                f"Allocator: {allocator_name}  |  {symbol_1_label} weight avg/min/max: "
+                f"{q_weight_mean:.2f}/{q_weight_min:.2f}/{q_weight_max:.2f}"
+            ),
+            f"{symbol_2_label} guard avg/min/max: {spy_guard_mean:.2f}/{spy_guard_min:.2f}/{spy_guard_max:.2f}",
             f"Avg monthly PnL: ${avg_monthly_pnl:,.0f}  |  Median: ${median_monthly_pnl:,.0f}",
             f"Positive months: {100.0 * monthly_positive_rate:.1f}%  |  Negative months: {100.0 * monthly_negative_rate:.1f}%",
             f"Top-5 positive month share: {100.0 * top5_positive_pnl_share:.1f}%  |  Zero-trade months: {100.0 * zero_trade_month_rate:.1f}%",
@@ -2391,10 +2862,16 @@ def main() -> None:
             f"Best day: {best_day.strftime('%Y-%m-%d')} ${best_day_amt:,.0f}",
             f"Worst day: {worst_day.strftime('%Y-%m-%d')} ${worst_day_amt:,.0f}",
             (
-                f"Pattern aid active (QQQ/SPY folds): {100.0 * q_pat_rate:.1f}%/{100.0 * s_pat_rate:.1f}%  |  "
+                f"Pattern aid active ({symbol_1_label}/{symbol_2_label} folds): {100.0 * q_pat_rate:.1f}%/{100.0 * s_pat_rate:.1f}%  |  "
                 f"Mean |p shift|: {q_pat_prob:.4f}/{s_pat_prob:.4f}"
                 if args.pattern_aid_enable
                 else "Pattern aid: disabled"
+            ),
+            (
+                f"Regime model pass-rate ({symbol_1_label}/{symbol_2_label}): {100.0 * q_regime_rate:.1f}%/{100.0 * s_regime_rate:.1f}%  |  "
+                f"Mean regime prob: {q_regime_prob:.3f}/{s_regime_prob:.3f}"
+                if args.regime_model_enable
+                else "Regime model: disabled"
             ),
             stress_text,
             boot_text,
@@ -2411,6 +2888,8 @@ def main() -> None:
         out_path=fig_path,
         start_capital=args.start_capital,
         stats_text=stats_text,
+        symbol_1_label=symbol_1_label,
+        symbol_2_label=symbol_2_label,
     )
 
     summary = {
@@ -2418,6 +2897,8 @@ def main() -> None:
             "script": "step3_train_and_backtest.py",
             "script_version": SCRIPT_VERSION,
             "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "display_symbol_1": symbol_1_label,
+            "display_symbol_2": symbol_2_label,
             "train_lookback_days": args.train_lookback_days,
             "embargo_days": args.embargo_days,
             "min_train_events": args.min_train_events,
@@ -2462,22 +2943,32 @@ def main() -> None:
             "pattern_ret_strength": args.pattern_ret_strength,
             "pattern_prob_max_abs_delta": args.pattern_prob_max_abs_delta,
             "pattern_ret_max_abs_delta": args.pattern_ret_max_abs_delta,
+            "exclude_leaky_features": bool(args.exclude_leaky_features),
+            "regime_model_enable": bool(args.regime_model_enable),
+            "regime_lookahead_events": args.regime_lookahead_events,
+            "regime_label_quantile": args.regime_label_quantile,
+            "regime_min_train_samples": args.regime_min_train_samples,
+            "regime_p_cut": args.regime_p_cut,
+            "regime_agg_p_cut": args.regime_agg_p_cut,
+            "regime_ev_scale": args.regime_ev_scale,
+            "regime_size_scale": args.regime_size_scale,
+            "regime_size_min_mult": args.regime_size_min_mult,
+            "regime_size_max_mult": args.regime_size_max_mult,
             "cost_stress_multipliers": cost_stress_multipliers,
             "bootstrap_samples": args.bootstrap_samples,
             "bootstrap_block_months": args.bootstrap_block_months,
             "bootstrap_seed": args.bootstrap_seed,
             "retune_every_folds": args.retune_every_folds,
             "model_stack": (
-                "LightGBM classifier/regressor/quantiles + ridge ensemble + calibrated probabilities + "
-                "confidence sizing + cross-asset pattern context aid"
-                if args.pattern_aid_enable
-                else "LightGBM classifier/regressor/quantiles + ridge ensemble + calibrated probabilities + confidence sizing"
+                "LightGBM classifier/regressor/quantiles + ridge ensemble + calibrated probabilities + confidence sizing"
+                + (" + cross-asset pattern context aid" if args.pattern_aid_enable else "")
+                + (" + regime classifier gate/sizer" if args.regime_model_enable else "")
             ),
             "note": (
-                "Nested walk-forward tuning with purge+embargo, drift-aware safety guard, monthly out-of-sample testing, "
-                "and pattern context aid."
-                if args.pattern_aid_enable
-                else "Nested walk-forward tuning with purge+embargo, drift-aware safety guard, and monthly out-of-sample testing."
+                "Nested walk-forward tuning with purge+embargo, drift-aware safety guard, and monthly out-of-sample testing."
+                + (" Pattern context aid enabled." if args.pattern_aid_enable else "")
+                + (" Regime classifier enabled." if args.regime_model_enable else "")
+                + (" Leaky outcome features excluded." if args.exclude_leaky_features else "")
             ),
         },
         "symbol_summaries": {

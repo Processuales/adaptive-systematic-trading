@@ -345,8 +345,8 @@ def tune_ml_thresholds(
     return best, best_df
 
 
-def sample_knobs(rng: np.random.Generator) -> s2.Knobs:
-    k = s2.default_knobs()
+def sample_knobs(rng: np.random.Generator, friction_profile: str) -> s2.Knobs:
+    k = s2.get_knobs_for_profile(friction_profile)
 
     k.trend_fast_span = int(rng.choice([8, 10, 12, 14, 16]))
     k.trend_slow_span = int(rng.choice([32, 40, 48, 56, 64]))
@@ -375,6 +375,21 @@ def sample_knobs(rng: np.random.Generator) -> s2.Knobs:
     return k
 
 
+def apply_market_hours_overrides(
+    bars_by_sym: Dict[str, pd.DataFrame],
+    market_hours: str,
+) -> Dict[str, pd.DataFrame]:
+    if market_hours != "24_7":
+        return bars_by_sym
+    out: Dict[str, pd.DataFrame] = {}
+    for sym, bars in bars_by_sym.items():
+        x = bars.copy()
+        x["entry_overnight"] = False
+        x["is_weekend"] = x["date"].dt.dayofweek.isin([5, 6]).astype(int)
+        out[sym] = x
+    return out
+
+
 def build_events_from_knobs(
     raw_by_sym: Dict[str, pd.DataFrame],
     symbols: List[str],
@@ -382,10 +397,12 @@ def build_events_from_knobs(
     cross_symbol: str,
     include_cross: bool,
     knobs: s2.Knobs,
+    market_hours: str,
 ) -> Tuple[pd.DataFrame, int]:
     bars_by_sym: Dict[str, pd.DataFrame] = {}
     for sym in symbols:
         bars_by_sym[sym] = s2.compute_bar_features(raw_by_sym[sym], sym, knobs)
+    bars_by_sym = apply_market_hours_overrides(bars_by_sym, market_hours=market_hours)
 
     trade_bars = bars_by_sym[trade_symbol].copy()
     tol = pd.Timedelta(knobs.cross_merge_tolerance)
@@ -433,6 +450,8 @@ def evaluate_trial(
     cross_symbol: str,
     include_cross: bool,
     knobs: s2.Knobs,
+    friction_profile: str,
+    market_hours: str,
     filter_name: str,
     min_trades_train: int,
     min_trades_test: int,
@@ -444,6 +463,7 @@ def evaluate_trial(
         cross_symbol=cross_symbol,
         include_cross=include_cross,
         knobs=knobs,
+        market_hours=market_hours,
     )
     if events.empty:
         return None
@@ -524,6 +544,8 @@ def evaluate_trial(
 
     return {
         "filter_name": filter_name,
+        "friction_profile": str(friction_profile),
+        "market_hours": str(market_hours),
         "knobs": asdict(knobs),
         "n_bars": int(n_bars),
         "split_bar_idx": int(split_bar_idx),
@@ -579,6 +601,7 @@ def build_full_events_for_result(
     include_cross: bool,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     knobs = s2.Knobs(**result["knobs"])
+    market_hours = str(result.get("market_hours") or "rth")
     events, _n_bars = build_events_from_knobs(
         raw_by_sym=raw_by_sym,
         symbols=symbols,
@@ -586,6 +609,7 @@ def build_full_events_for_result(
         cross_symbol=cross_symbol,
         include_cross=include_cross,
         knobs=knobs,
+        market_hours=market_hours,
     )
     base = apply_policy_filter(events, result["filter_name"])
     if base.empty:
@@ -669,6 +693,18 @@ def main() -> None:
     ap.add_argument("--min-trades-test", type=int, default=25, help="Minimum test trades after gating")
     ap.add_argument("--top-n-json", type=int, default=30, help="How many top trials to keep in output JSON")
     ap.add_argument("--filters", type=str, default="", help="Comma-separated filter names to sweep (default built-in set)")
+    ap.add_argument(
+        "--friction-profile",
+        choices=["equity", "crypto"],
+        default="equity",
+        help="Friction model profile passed into Step 2 event generation.",
+    )
+    ap.add_argument(
+        "--market-hours",
+        choices=["rth", "24_7"],
+        default="rth",
+        help="Market-hours mode: use '24_7' for crypto-style data.",
+    )
     ap.add_argument("--pretty-json", action="store_true", help="Write indented JSON")
     args = ap.parse_args()
 
@@ -712,7 +748,7 @@ def main() -> None:
     results: List[Dict] = []
 
     for i in range(args.n_trials):
-        knobs = sample_knobs(rng)
+        knobs = sample_knobs(rng, friction_profile=args.friction_profile)
         knobs.include_cross_asset = include_cross
         knobs.cross_symbol = cross_symbol
         filter_name = str(rng.choice(filter_names))
@@ -724,6 +760,8 @@ def main() -> None:
             cross_symbol=cross_symbol,
             include_cross=include_cross,
             knobs=knobs,
+            friction_profile=args.friction_profile,
+            market_hours=args.market_hours,
             filter_name=filter_name,
             min_trades_train=args.min_trades_train,
             min_trades_test=args.min_trades_test,
@@ -771,6 +809,8 @@ def main() -> None:
             "symbols": symbols,
             "cross_symbol": cross_symbol,
             "include_cross": include_cross,
+            "friction_profile": str(args.friction_profile),
+            "market_hours": str(args.market_hours),
             "split_policy": "80/20 chronological by bar index; train uses label_end_idx < split, test uses t_idx >= split",
         },
         "constraints": {

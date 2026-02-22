@@ -4,7 +4,7 @@ Full BTC/ETH pipeline in isolated workspace:
 1) Download history from IBKR (optional)
 2) Prepare/clean data + alias mapping (QQQ->BTC, SPY->ETH)
 3) Step 2 full pipeline
-4) Step 3 full pipeline (optimize + optional pattern experiment)
+4) Step 3 full pipeline (optimize + BTC/ETH tuning + hybrid overlay)
 5) Compact final charts/reports under this pair folder
 """
 
@@ -19,6 +19,10 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
 APP = "BTC-ETH-PIPE"
 
@@ -92,6 +96,8 @@ def run_step2_compare_with_fallback(
     n_trials: int,
     seed: int,
     trade_constraints_fallback: list[tuple[int, int]],
+    friction_profile: str,
+    market_hours: str,
     heartbeat_seconds: float,
 ) -> bool:
     for mt_train, mt_test in trade_constraints_fallback:
@@ -110,6 +116,10 @@ def run_step2_compare_with_fallback(
             str(mt_train),
             "--min-trades-test",
             str(mt_test),
+            "--friction-profile",
+            str(friction_profile),
+            "--market-hours",
+            str(market_hours),
         ]
         try:
             run_cmd(cmd, cwd=repo_root, heartbeat_seconds=heartbeat_seconds)
@@ -221,7 +231,7 @@ def prune_verbose_final_outputs(final_dir: Path) -> None:
             log(f"removed verbose final dir: {path}")
 
 
-def write_compact_final_report(final_dir: Path, start_capital: float) -> None:
+def write_compact_final_report(final_dir: Path, step3_out: Path, start_capital: float) -> None:
     reports_dir = final_dir / "reports"
     charts_dir = final_dir / "charts"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -234,6 +244,23 @@ def write_compact_final_report(final_dir: Path, start_capital: float) -> None:
     with report_path.open("r", encoding="utf-8") as f:
         old = json.load(f)
 
+    hybrid_report_path = step3_out / "optimization" / "btc_eth_hybrid_overlay_report.json"
+    hybrid_report = {}
+    if hybrid_report_path.exists():
+        try:
+            with hybrid_report_path.open("r", encoding="utf-8") as f:
+                hybrid_report = json.load(f)
+        except Exception:
+            hybrid_report = {}
+
+    promoted = bool(hybrid_report.get("promoted"))
+    best_row = hybrid_report.get("best_candidate") or {}
+    best_promotable_row = hybrid_report.get("best_promotable_candidate") or {}
+    selected_row = best_promotable_row if (promoted and best_promotable_row) else best_row
+    selected_name = hybrid_report.get("promoted_from") if promoted else "active_baseline"
+    if not selected_name and selected_row:
+        selected_name = selected_row.get("name")
+
     compact = {
         "meta": {
             "script": "run_btc_eth_pipeline.py",
@@ -242,6 +269,7 @@ def write_compact_final_report(final_dir: Path, start_capital: float) -> None:
             "display_symbols": ["BTC", "ETH"],
             "start_capital": float(start_capital),
             "note": "Compact side-pair summary for BTC+ETH.",
+            "hybrid_overlay_promoted": promoted,
         },
         "paths": {
             "final_root": str(final_dir),
@@ -249,15 +277,177 @@ def write_compact_final_report(final_dir: Path, start_capital: float) -> None:
             "reports_dir": str(reports_dir),
             "step2_chart": str(charts_dir / "01_step2_ml_simulation_btc_eth.png"),
             "step3_chart": str(charts_dir / "02_step3_real_ml_btc_eth.png"),
+            "hybrid_overlay_report": str(hybrid_report_path) if hybrid_report else None,
         },
         "snapshots": {
             "step2_ml_simulation": (old.get("snapshots") or {}).get("step2_ml_simulation"),
             "step3_real_ml": (old.get("snapshots") or {}).get("step3_real_ml"),
+            "step3_hybrid_overlay": {
+                "promoted": promoted,
+                "promoted_from": hybrid_report.get("promoted_from"),
+                "best_candidate": best_row.get("name"),
+                "best_metrics": best_row.get("metrics"),
+                "selected_candidate": selected_name,
+                "selected_metrics": (selected_row or {}).get("metrics"),
+            }
+            if hybrid_report
+            else None,
         },
     }
     with report_path.open("w", encoding="utf-8") as f:
         json.dump(compact, f, separators=(",", ":"), ensure_ascii=True)
     log(f"wrote compact report: {report_path}")
+
+
+def as_money(x: float) -> str:
+    sign = "-" if x < 0 else ""
+    return f"{sign}${abs(float(x)):,.0f}"
+
+
+def normalize_monthly(monthly: pd.DataFrame) -> pd.DataFrame:
+    if monthly.empty:
+        return pd.DataFrame(columns=["month_end", "equity", "pnl", "ret", "trades"])
+    x = monthly.copy()
+    x["month_end"] = pd.to_datetime(x["month_end"], utc=True, errors="coerce")
+    x = x.dropna(subset=["month_end"]).sort_values("month_end").reset_index(drop=True)
+    for c in ("equity", "pnl", "ret", "trades"):
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0).astype(float)
+        else:
+            x[c] = 0.0
+    return x
+
+
+def rewrite_btc_eth_step3_chart(final_dir: Path, step3_out: Path, start_capital: float) -> None:
+    summary_path = step3_out / "backtest" / "step3_summary.json"
+    monthly_path = step3_out / "backtest" / "step3_monthly_table.parquet"
+    if (not summary_path.exists()) or (not monthly_path.exists()):
+        log("skip btc/eth step3 chart rewrite (missing summary/monthly source).")
+        return
+
+    with summary_path.open("r", encoding="utf-8") as f:
+        s3 = json.load(f)
+    monthly = normalize_monthly(pd.read_parquet(monthly_path))
+    if monthly.empty:
+        log("skip btc/eth step3 chart rewrite (empty monthly table).")
+        return
+
+    p = s3.get("portfolio") or {}
+    perf = p.get("dual_perf") or {}
+    allocator = p.get("allocator") or {}
+    stress = p.get("cost_stress_tests") or []
+    boot = p.get("bootstrap") or {}
+    s125 = next((r for r in stress if abs(float(r.get("cost_multiplier") or 0.0) - 1.25) <= 0.03), {})
+    s150 = next((r for r in stress if abs(float(r.get("cost_multiplier") or 0.0) - 1.50) <= 0.03), {})
+    bavg = (boot.get("avg_monthly_pnl") or {}) if bool(boot.get("enabled")) else {}
+
+    avg_pnl = float(p.get("avg_monthly_pnl") or 0.0)
+    med_pnl = float(p.get("median_monthly_pnl") or 0.0)
+    avg_tpm = float(p.get("avg_monthly_trades") or 0.0)
+    pos_rate = float(p.get("monthly_positive_rate") or 0.0)
+    end_eq = float(perf.get("end_equity") or start_capital)
+    cagr = float(perf.get("cagr") or 0.0)
+    mdd = float(perf.get("max_drawdown") or 0.0)
+    calmar = float(perf.get("calmar") or 0.0)
+    best_month = p.get("best_month") or {}
+    worst_month = p.get("worst_month") or {}
+    mode = str(allocator.get("selected") or "n/a")
+
+    stats_lines = [
+        f"End equity: {as_money(end_eq)}",
+        f"CAGR: {100.0 * cagr:.2f}%  |  Max drawdown: {100.0 * mdd:.2f}%",
+        f"Calmar: {calmar:.2f}",
+        f"Average monthly PnL: {as_money(avg_pnl)}  |  Median: {as_money(med_pnl)}",
+        f"Positive months: {100.0 * pos_rate:.1f}%  |  Avg trades/month: {avg_tpm:.1f}",
+        f"Allocator mode: {mode}",
+    ]
+    if mode == "btc_eth_hybrid_core_satellite":
+        stats_lines.append(
+            "Hybrid core/active: "
+            f"core={float(allocator.get('core_fraction') or 0.0):.2f}, "
+            f"active={float(allocator.get('active_sleeve_share') or 0.0):.2f}"
+        )
+        stats_lines.append(
+            "Core BTC weight avg/min/max: "
+            f"{float(allocator.get('core_btc_weight_mean') or 0.0):.2f}/"
+            f"{float(allocator.get('core_btc_weight_min') or 0.0):.2f}/"
+            f"{float(allocator.get('core_btc_weight_max') or 0.0):.2f}"
+        )
+    stats_lines += [
+        (
+            f"Best month: {str(best_month.get('month_end', 'n/a'))[:7]} "
+            f"{as_money(best_month.get('pnl', 0.0))}"
+        ),
+        (
+            f"Worst month: {str(worst_month.get('month_end', 'n/a'))[:7]} "
+            f"{as_money(worst_month.get('pnl', 0.0))}"
+        ),
+        f"Cost stress x1.25 avg monthly: {as_money(s125.get('avg_monthly_pnl', 0.0))}",
+        f"Cost stress x1.50 avg monthly: {as_money(s150.get('avg_monthly_pnl', 0.0))}",
+        (
+            "Bootstrap P10/P50/P90 monthly PnL: "
+            f"{as_money(bavg.get('p10', 0.0))}/{as_money(bavg.get('p50', 0.0))}/{as_money(bavg.get('p90', 0.0))}"
+            if bavg
+            else "Bootstrap P10/P50/P90 monthly PnL: n/a"
+        ),
+    ]
+
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        3,
+        1,
+        figsize=(15, 10),
+        gridspec_kw={"height_ratios": [3.2, 1.4, 1.1]},
+    )
+    ax1.plot(monthly["month_end"], monthly["equity"], color="#1d3557", linewidth=2.2, label="Portfolio equity")
+    ax1.axhline(start_capital, color="black", linewidth=0.8, linestyle="--", alpha=0.7, label="Start capital")
+    ax1.set_title("Step 3 Real ML Backtest (BTC + ETH)\nWalk-forward ML with BTC/ETH risk-aware overlay")
+    ax1.set_ylabel("Equity ($)")
+    ax1.grid(alpha=0.22)
+    ax1.legend(loc="lower right", framealpha=0.92)
+    ax1.text(
+        0.01,
+        0.99,
+        "\n".join(stats_lines),
+        transform=ax1.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox={"boxstyle": "round,pad=0.4", "facecolor": "white", "alpha": 0.88, "edgecolor": "#999999"},
+    )
+
+    pnl = monthly["pnl"].to_numpy(dtype=float)
+    colors = np.where(pnl >= 0.0, "#2a9d8f", "#d62828")
+    ax2.bar(monthly["month_end"], pnl, width=20, color=colors, alpha=0.86)
+    ax2.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+    ax2.set_title("Monthly Profit / Loss")
+    ax2.set_ylabel("Monthly PnL ($)")
+    ax2.grid(alpha=0.2)
+
+    trades = monthly["trades"].to_numpy(dtype=float)
+    ax3.bar(monthly["month_end"], trades, width=20, color="#264653", alpha=0.74, label="Trades/month")
+    ax3.plot(
+        monthly["month_end"],
+        pd.Series(trades).rolling(3, min_periods=1).mean().to_numpy(dtype=float),
+        color="#e76f51",
+        linewidth=1.5,
+        label="3-month avg trades",
+    )
+    ax3.set_title("Trading Activity")
+    ax3.set_ylabel("# Trades")
+    ax3.set_xlabel("Time (UTC)")
+    ax3.grid(alpha=0.2)
+    ax3.legend(loc="upper right", framealpha=0.92)
+
+    fig.tight_layout()
+    step3_chart = final_dir / "charts" / "02_step3_real_ml_btc_eth.png"
+    step3_chart.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(step3_chart, dpi=160)
+    backtest_chart = step3_out / "backtest" / "step3_dual_portfolio_curve.png"
+    backtest_chart.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(backtest_chart, dpi=160)
+    plt.close(fig)
+    log(f"rewrote step3 btc/eth chart without alias labels: {step3_chart}")
+    log(f"rewrote step3 backtest chart without alias labels: {backtest_chart}")
 
 
 def write_final_readme(final_dir: Path) -> None:
@@ -288,6 +478,12 @@ def main() -> None:
     ap.add_argument("--skip-final", action="store_true")
     ap.add_argument("--skip-pattern", action="store_true")
     ap.add_argument("--skip-step3-btceth-tune", action="store_true")
+    ap.add_argument("--skip-step3-hybrid", action="store_true")
+    ap.add_argument(
+        "--enable-pattern",
+        action="store_true",
+        help="Opt-in: run BTC/ETH pattern-aid experiment (disabled by default).",
+    )
     ap.add_argument("--start-capital", type=float, default=10000.0)
     ap.add_argument("--step2-n-trials", type=int, default=48)
     ap.add_argument("--step2-seed", type=int, default=42)
@@ -323,6 +519,19 @@ def main() -> None:
     ap.add_argument("--download-years-back", type=int, default=6)
     ap.add_argument("--heartbeat-seconds", type=float, default=30.0)
     ap.add_argument("--pattern-reuse-existing-runs", action="store_true")
+    ap.add_argument("--hybrid-core-fractions", default="0.30,0.50,0.70,0.85")
+    ap.add_argument("--hybrid-core-btc-shares", default="0.30,0.50,0.70,0.85")
+    ap.add_argument("--hybrid-active-scales", default="1.00,0.80,0.60")
+    ap.add_argument("--hybrid-core-modes", default="fixed,vol_parity_6m")
+    ap.add_argument("--hybrid-min-stress125-avg-monthly-pnl", type=float, default=0.0)
+    ap.add_argument("--hybrid-min-stress150-avg-monthly-pnl", type=float, default=0.0)
+    ap.add_argument("--hybrid-min-bootstrap-p10-monthly-pnl", type=float, default=0.0)
+    ap.add_argument("--hybrid-max-drawdown-cap", type=float, default=0.35)
+    ap.add_argument("--hybrid-min-active-sleeve-share", type=float, default=0.05)
+    ap.add_argument("--hybrid-promote-avg-monthly-pnl-margin", type=float, default=8.0)
+    ap.add_argument("--hybrid-promote-calmar-tolerance", type=float, default=0.05)
+    ap.add_argument("--hybrid-promote-drawdown-tolerance", type=float, default=0.03)
+    ap.add_argument("--hybrid-no-promote", action="store_true")
     args = ap.parse_args()
 
     trade_constraints_fallback = parse_trade_constraints(args.step2_trade_constraint_fallback)
@@ -346,12 +555,15 @@ def main() -> None:
     step3_out = pair_root / "step3_out"
     final_dir = pair_root / "final output"
     pattern_ready = True
+    pattern_enabled = bool(args.enable_pattern and (not args.skip_pattern))
 
     log("start")
     log(
         f"workspace={pair_root} start_capital={args.start_capital} "
         f"download_years_back={args.download_years_back}"
     )
+    if not pattern_enabled:
+        log("pattern experiment is disabled by default for BTC/ETH (use --enable-pattern to opt in).")
 
     if not args.skip_download:
         run_cmd(
@@ -411,6 +623,10 @@ def main() -> None:
                 "QQQ",
                 "--trade-symbol",
                 "QQQ",
+                "--friction-profile",
+                "crypto",
+                "--market-hours",
+                "24_7",
             ],
             cwd=repo_root,
             heartbeat_seconds=args.heartbeat_seconds,
@@ -437,6 +653,8 @@ def main() -> None:
             n_trials=args.step2_n_trials,
             seed=args.step2_seed,
             trade_constraints_fallback=trade_constraints_fallback,
+            friction_profile="crypto",
+            market_hours="24_7",
             heartbeat_seconds=args.heartbeat_seconds,
         )
         if not ok_compare:
@@ -509,6 +727,10 @@ def main() -> None:
                 str(clean_alias_dir),
                 "--out-dir",
                 str(step3_out),
+                "--friction-profile",
+                "crypto",
+                "--market-hours",
+                "24_7",
             ],
             cwd=repo_root,
             heartbeat_seconds=args.heartbeat_seconds,
@@ -526,6 +748,7 @@ def main() -> None:
                     str(args.start_capital),
                     "--max-candidates",
                     str(args.step3_max_candidates),
+                    "--crypto-mode",
                     "--final-dir",
                     str(final_dir / "step3"),
                 ],
@@ -575,6 +798,11 @@ def main() -> None:
                     "--portfolio-min-train-days",
                     "90",
                     "--portfolio-no-spy-guard",
+                    "--exclude-leaky-features",
+                    "--display-symbol-1",
+                    "BTC",
+                    "--display-symbol-2",
+                    "ETH",
                 ],
                 cwd=repo_root,
                 heartbeat_seconds=args.heartbeat_seconds,
@@ -597,9 +825,49 @@ def main() -> None:
                 cwd=repo_root,
                 heartbeat_seconds=args.heartbeat_seconds,
             )
+        if not args.skip_step3_hybrid:
+            run_cmd(
+                [
+                    py,
+                    str(pair_root / "scripts" / "optimize_step3_hybrid_btc_eth.py"),
+                    "--step3-out-dir",
+                    str(step3_out),
+                    "--alias-dir",
+                    str(clean_alias_dir),
+                    "--start-capital",
+                    str(args.start_capital),
+                    "--core-fractions",
+                    str(args.hybrid_core_fractions),
+                    "--core-btc-shares",
+                    str(args.hybrid_core_btc_shares),
+                    "--active-scales",
+                    str(args.hybrid_active_scales),
+                    "--core-modes",
+                    str(args.hybrid_core_modes),
+                    "--min-stress125-avg-monthly-pnl",
+                    str(args.hybrid_min_stress125_avg_monthly_pnl),
+                    "--min-stress150-avg-monthly-pnl",
+                    str(args.hybrid_min_stress150_avg_monthly_pnl),
+                    "--min-bootstrap-p10-monthly-pnl",
+                    str(args.hybrid_min_bootstrap_p10_monthly_pnl),
+                    "--max-drawdown-cap",
+                    str(args.hybrid_max_drawdown_cap),
+                    "--min-active-sleeve-share",
+                    str(args.hybrid_min_active_sleeve_share),
+                    "--promote-avg-monthly-pnl-margin",
+                    str(args.hybrid_promote_avg_monthly_pnl_margin),
+                    "--promote-calmar-tolerance",
+                    str(args.hybrid_promote_calmar_tolerance),
+                    "--promote-drawdown-tolerance",
+                    str(args.hybrid_promote_drawdown_tolerance),
+                ]
+                + (["--no-promote"] if args.hybrid_no_promote else []),
+                cwd=repo_root,
+                heartbeat_seconds=args.heartbeat_seconds,
+            )
 
     if (
-        (not args.skip_pattern)
+        pattern_enabled
         and pattern_ready
         and (step3_out / "optimization" / "step3_best_config.json").exists()
     ):
@@ -620,7 +888,7 @@ def main() -> None:
         if args.pattern_reuse_existing_runs:
             pattern_cmd.append("--reuse-existing-runs")
         run_cmd(pattern_cmd, cwd=repo_root, heartbeat_seconds=args.heartbeat_seconds)
-    elif not args.skip_pattern:
+    elif pattern_enabled:
         log("skipping pattern experiment (best config unavailable).")
 
     if not args.skip_final:
@@ -645,7 +913,7 @@ def main() -> None:
             "--skip-step3",
         ]
         if (
-            (not args.skip_pattern)
+            pattern_enabled
             and pattern_ready
             and (step3_out / "optimization" / "step3_best_config.json").exists()
         ):
@@ -654,9 +922,10 @@ def main() -> None:
                 "--pattern-reuse-existing-runs",
             ]
         run_cmd(final_cmd, cwd=repo_root, heartbeat_seconds=args.heartbeat_seconds)
+        rewrite_btc_eth_step3_chart(final_dir=final_dir, step3_out=step3_out, start_capital=args.start_capital)
         remove_legacy_named_outputs(final_dir)
         prune_verbose_final_outputs(final_dir)
-        write_compact_final_report(final_dir, start_capital=args.start_capital)
+        write_compact_final_report(final_dir, step3_out=step3_out, start_capital=args.start_capital)
         write_final_readme(final_dir)
 
     log("complete")

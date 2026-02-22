@@ -120,6 +120,47 @@ def default_knobs() -> Knobs:
     return k
 
 
+def crypto_knobs() -> Knobs:
+    """Friction knobs calibrated for crypto spot/perp execution.
+
+    Spreads are set conservatively above typical Binance/Coinbase taker
+    fills for 1-hour bars on BTC and ETH.  The alias layer maps BTC->QQQ
+    and ETH->SPY, so the dict uses the alias names.
+    """
+    k = Knobs()
+    k.spread_half_bps = {
+        # BTC aliased as QQQ – major exchange taker, 1h bars
+        "QQQ": 3.5,
+        # ETH aliased as SPY – slightly wider than BTC
+        "SPY": 5.0,
+        # real equity defaults kept for completeness
+        "BTC": 3.5,
+        "ETH": 5.0,
+        "SMH": 1.8,
+    }
+    k.slip_base_bps = 2.5          # crypto base slippage per side
+    k.slip_vol_mult = 0.08         # increased vol-dependent component
+    k.slip_spike_add_bps = 8.0     # vol-spike add (crypto flash wicks)
+    k.overnight_slip_add_bps = 0.0 # crypto has no session gap
+    k.commission_round_trip_bps = 7.0  # conservative taker RT
+    return k
+
+
+def get_knobs_for_profile(profile: str) -> Knobs:
+    """Return a Knobs instance for the given friction profile name."""
+    _factories = {
+        "equity": default_knobs,
+        "crypto": crypto_knobs,
+    }
+    factory = _factories.get(profile.lower())
+    if factory is None:
+        raise ValueError(
+            f"Unknown friction profile '{profile}'. "
+            f"Choose from: {sorted(_factories)}"
+        )
+    return factory()
+
+
 # -----------------------------
 # IO helpers
 # -----------------------------
@@ -212,6 +253,8 @@ def compute_gap_stats_event_window(
     Critical: prevent leakage by shifting rolling results by 1 gap event.
     """
     # Identify bars where the next bar is next NY session (known by timestamp/calendar, not future prices)
+    # For 24/7 markets (crypto), entry_overnight is always False unless replaced
+    # by weekend detection downstream.
     sdate = session_date_ny(out["date"])
     sdate_next = sdate.shift(-1)
     out["entry_overnight"] = (sdate_next.notna()) & (sdate_next != sdate)
@@ -646,6 +689,7 @@ def build_event_dataset(bars: pd.DataFrame, sym: str, knobs: Knobs) -> pd.DataFr
         "sigma_prank",
         "u_atr_prank",
         "intraday_tail_frac",
+        "is_weekend",
     ]
     feature_arrays: Dict[str, np.ndarray] = {
         c: bars[c].to_numpy(dtype=float) if c in bars.columns else np.full(n, np.nan, dtype=float)
@@ -817,9 +861,21 @@ def main() -> None:
     ap.add_argument("--cross-symbol", default="SPY", help="Cross symbol for context (default SPY)")
     ap.add_argument("--cross-tolerance", default="30min", help="merge_asof tolerance (default 30min)")
     ap.add_argument("--same-bar-policy", choices=["worst", "best", "close_direction"], default=None, help="Override same-bar policy")
+    ap.add_argument(
+        "--friction-profile",
+        choices=["equity", "crypto"],
+        default="equity",
+        help="Friction model profile: 'equity' (SPY/QQQ defaults) or 'crypto' (BTC/ETH-calibrated).",
+    )
+    ap.add_argument(
+        "--market-hours",
+        choices=["rth", "24_7"],
+        default="rth",
+        help="Market hours mode: 'rth' for regular trading hours, '24_7' for crypto.",
+    )
     args = ap.parse_args()
 
-    knobs = default_knobs()
+    knobs = get_knobs_for_profile(args.friction_profile)
     if args.no_cross:
         knobs.include_cross_asset = False
     knobs.cross_symbol = args.cross_symbol.upper()
@@ -854,8 +910,17 @@ def main() -> None:
         feat = compute_bar_features(raw, sym, knobs)
         bars_by_sym[sym] = feat
 
+    # For 24/7 markets, disable overnight detection and add weekend flag
+    if args.market_hours == "24_7":
+        for sym in bars_by_sym:
+            bars_by_sym[sym]["entry_overnight"] = False
+            # Add weekend flag as a substitute for session-boundary features
+            bars_by_sym[sym]["is_weekend"] = bars_by_sym[sym]["date"].dt.dayofweek.isin([5, 6]).astype(int)
+        print("[24/7] Disabled entry_overnight; added is_weekend feature.")
+
+    for sym in symbols:
         out_path = os.path.join(out_bar, f"{sym.lower()}_bar_features.parquet")
-        feat.to_parquet(out_path, index=False)
+        bars_by_sym[sym].to_parquet(out_path, index=False)
         print(f"[{sym}] wrote bar features: {out_path}")
 
     trade_bars = bars_by_sym[trade_sym].copy()

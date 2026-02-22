@@ -381,6 +381,7 @@ def run_cfg(
     out_dir: Path,
     start_capital: float,
     cfg: Dict,
+    crypto_mode: bool = False,
 ) -> Dict:
     cmd = [
         py,
@@ -490,6 +491,14 @@ def run_cfg(
         cmd.append("--drought-relief-enable")
     if bool(cfg.get("pattern_aid_enable", False)):
         cmd.append("--pattern-aid-enable")
+    if bool(crypto_mode):
+        cmd += [
+            "--exclude-leaky-features",
+            "--display-symbol-1",
+            "BTC",
+            "--display-symbol-2",
+            "ETH",
+        ]
     subprocess.run(cmd, check=True, cwd=str(repo_root))
     s_path = out_dir / "backtest" / "step3_summary.json"
     if not s_path.exists():
@@ -571,6 +580,11 @@ def main() -> None:
     ap.add_argument("--min-stress150-avg-monthly-pnl", type=float, default=20.0)
     ap.add_argument("--min-bootstrap-p10-monthly-pnl", type=float, default=20.0)
     ap.add_argument("--max-candidates", type=int, default=8)
+    ap.add_argument(
+        "--crypto-mode",
+        action="store_true",
+        help="Pass crypto safety flags into step3_train_and_backtest (e.g., leaky-feature exclusion).",
+    )
     ap.add_argument("--final-dir", default="final output/step3", help="Consolidated final Step 3 artifacts path.")
     args = ap.parse_args()
 
@@ -609,6 +623,7 @@ def main() -> None:
                 out_dir=run_dir,
                 start_capital=args.start_capital,
                 cfg=cfg,
+                crypto_mode=bool(args.crypto_mode),
             )
             score = objective_from_summary(
                 summary=summary,
@@ -672,6 +687,7 @@ def main() -> None:
         out_dir=out_root,
         start_capital=args.start_capital,
         cfg=best_cfg,
+        crypto_mode=bool(args.crypto_mode),
     )
 
     best_report = {
@@ -695,6 +711,7 @@ def main() -> None:
             "min_bootstrap_p10_monthly_pnl": args.min_bootstrap_p10_monthly_pnl,
             "n_robust_pass": len(robust_rows),
             "fallback_used": fallback_used,
+            "crypto_mode": bool(args.crypto_mode),
             "note": "Best candidate re-run into main --out-dir.",
         },
         "best": best,

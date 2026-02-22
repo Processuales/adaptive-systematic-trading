@@ -93,9 +93,9 @@ Main files:
 - `step4_optimize_allocator.py`
 - `step4_run_all.py`
 
-## Things We Added That Are Not Just Textbook
+## Interesting things I added
 
-These are the parts I think are interesting for quants:
+These are the parts I think are interesting:
 
 - **Drift guard** logic that soft-kills exposure when behavior changes.
 - **Drought relief** logic that relaxes thresholds a bit when trade count dries up.

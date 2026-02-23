@@ -28,9 +28,12 @@ Source: `final output/reports/final_output_summary.json`
 
 ### BTC + ETH
 
-- Avg monthly PnL: **$120.99**
-- End equity: **$21,009.91**
-- Bootstrap p10 avg monthly PnL: **$25.75**
+- Avg monthly PnL: **$163.67**
+- End equity: **$24,730.00**
+- Max drawdown: **19.65%**
+- Calmar: **0.66**
+- Stress (1.25x costs): **$161.65** avg monthly PnL
+- Bootstrap p10 avg monthly PnL: **$56.81**
 
 ![BTC ETH Step2](other-pair/btc_eth/final%20output/charts/01_step2_ml_simulation_btc_eth.png)
 ![BTC ETH Step3](other-pair/btc_eth/final%20output/charts/02_step3_real_ml_btc_eth.png)
@@ -53,6 +56,16 @@ Also available:
 
 - `final output/combined/charts/SPYQQQ_BTCETH_combined_chart.png`
 - `final output/combined/charts/SPYQQQ_BTCETH_combined_chart_calmar.png`
+
+## Overfit Check (BTC + ETH)
+
+From the latest diagnostics:
+
+- promoted hybrid model risk label: **low**
+- active baseline risk label: **high**
+- promoted model passed all current checks (time split, concentration, significance, bootstrap tail)
+
+Source: `other-pair/btc_eth/step3_out/optimization/overfit_diagnostics_report.json`
 
 ## How The Code Works
 

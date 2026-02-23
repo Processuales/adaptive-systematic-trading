@@ -519,18 +519,19 @@ def main() -> None:
     ap.add_argument("--download-years-back", type=int, default=6)
     ap.add_argument("--heartbeat-seconds", type=float, default=30.0)
     ap.add_argument("--pattern-reuse-existing-runs", action="store_true")
-    ap.add_argument("--hybrid-core-fractions", default="0.30,0.50,0.70,0.85")
+    ap.add_argument("--hybrid-core-fractions", default="0.20,0.30,0.50,0.70,0.85")
     ap.add_argument("--hybrid-core-btc-shares", default="0.30,0.50,0.70,0.85")
-    ap.add_argument("--hybrid-active-scales", default="1.00,0.80,0.60")
-    ap.add_argument("--hybrid-core-modes", default="fixed,vol_parity_6m")
+    ap.add_argument("--hybrid-active-scales", default="1.00,0.80,0.60,0.40,0.25,0.15")
+    ap.add_argument("--hybrid-core-modes", default="fixed,vol_parity_6m,trend_guard_6m,risk_parity_mom_6m")
     ap.add_argument("--hybrid-min-stress125-avg-monthly-pnl", type=float, default=0.0)
     ap.add_argument("--hybrid-min-stress150-avg-monthly-pnl", type=float, default=0.0)
     ap.add_argument("--hybrid-min-bootstrap-p10-monthly-pnl", type=float, default=0.0)
-    ap.add_argument("--hybrid-max-drawdown-cap", type=float, default=0.35)
+    ap.add_argument("--hybrid-max-drawdown-cap", type=float, default=0.22)
     ap.add_argument("--hybrid-min-active-sleeve-share", type=float, default=0.05)
-    ap.add_argument("--hybrid-promote-avg-monthly-pnl-margin", type=float, default=8.0)
+    ap.add_argument("--hybrid-promote-avg-monthly-pnl-margin", type=float, default=5.0)
     ap.add_argument("--hybrid-promote-calmar-tolerance", type=float, default=0.05)
-    ap.add_argument("--hybrid-promote-drawdown-tolerance", type=float, default=0.03)
+    ap.add_argument("--hybrid-promote-drawdown-tolerance", type=float, default=0.02)
+    ap.add_argument("--hybrid-promote-absolute-max-drawdown", type=float, default=0.20)
     ap.add_argument("--hybrid-no-promote", action="store_true")
     args = ap.parse_args()
 
@@ -860,6 +861,8 @@ def main() -> None:
                     str(args.hybrid_promote_calmar_tolerance),
                     "--promote-drawdown-tolerance",
                     str(args.hybrid_promote_drawdown_tolerance),
+                    "--promote-absolute-max-drawdown",
+                    str(args.hybrid_promote_absolute_max_drawdown),
                 ]
                 + (["--no-promote"] if args.hybrid_no_promote else []),
                 cwd=repo_root,

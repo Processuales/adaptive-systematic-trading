@@ -81,6 +81,7 @@ def metric_snapshot(summary: Dict[str, Any]) -> Dict[str, float]:
     p = summary.get("portfolio") or {}
     perf = p.get("dual_perf") or {}
     s125 = stress_row(p, 1.25)
+    s150 = stress_row(p, 1.50)
     boot = p.get("bootstrap") or {}
     boot_avg = boot.get("avg_monthly_pnl") or {}
     return {
@@ -91,27 +92,51 @@ def metric_snapshot(summary: Dict[str, Any]) -> Dict[str, float]:
         "avg_monthly_trades": float(p.get("avg_monthly_trades") or 0.0),
         "positive_month_rate": float(p.get("monthly_positive_rate") or 0.0),
         "stress_1_25_avg_monthly_pnl": float(s125.get("avg_monthly_pnl") or 0.0),
+        "stress_1_50_avg_monthly_pnl": float(s150.get("avg_monthly_pnl") or 0.0),
         "bootstrap_p10_avg_monthly_pnl": float(boot_avg.get("p10") or 0.0),
     }
 
 
 def score_snapshot(m: Dict[str, float]) -> float:
     return float(
-        0.70 * m["avg_monthly_pnl"]
-        + 65.0 * m["calmar"]
-        - 70.0 * m["max_drawdown"]
-        + 0.25 * m["stress_1_25_avg_monthly_pnl"]
-        + 0.12 * m["bootstrap_p10_avg_monthly_pnl"]
+        0.55 * m["avg_monthly_pnl"]
+        + 85.0 * m["calmar"]
+        - 180.0 * m["max_drawdown"]
+        + 0.20 * m["stress_1_25_avg_monthly_pnl"]
+        + 0.18 * m["stress_1_50_avg_monthly_pnl"]
+        + 0.14 * m["bootstrap_p10_avg_monthly_pnl"]
+        + 20.0 * m["positive_month_rate"]
     )
 
 
+def robust_pass(metrics: Dict[str, float]) -> tuple[bool, List[str]]:
+    fails: List[str] = []
+    if metrics["max_drawdown"] > 0.28:
+        fails.append(f"max_drawdown {metrics['max_drawdown']:.4f} > 0.2800")
+    if metrics["stress_1_25_avg_monthly_pnl"] <= 0.0:
+        fails.append(
+            f"stress_1_25_avg_monthly_pnl {metrics['stress_1_25_avg_monthly_pnl']:.2f} <= 0"
+        )
+    if metrics["bootstrap_p10_avg_monthly_pnl"] <= -5.0:
+        fails.append(
+            f"bootstrap_p10_avg_monthly_pnl {metrics['bootstrap_p10_avg_monthly_pnl']:.2f} <= -5.00"
+        )
+    if metrics["positive_month_rate"] < 0.45:
+        fails.append(f"positive_month_rate {metrics['positive_month_rate']:.3f} < 0.450")
+    return (len(fails) == 0), fails
+
+
 def should_promote(best: Dict[str, float], baseline: Dict[str, float]) -> bool:
-    if best["avg_monthly_pnl"] >= baseline["avg_monthly_pnl"] + 10.0:
+    if (
+        best["avg_monthly_pnl"] >= baseline["avg_monthly_pnl"] + 8.0
+        and best["max_drawdown"] <= baseline["max_drawdown"] + 0.02
+        and best["calmar"] >= baseline["calmar"] - 0.03
+    ):
         return True
     if (
         best["avg_monthly_pnl"] >= baseline["avg_monthly_pnl"]
-        and best["calmar"] >= baseline["calmar"]
-        and best["max_drawdown"] <= baseline["max_drawdown"] + 0.02
+        and best["calmar"] >= baseline["calmar"] + 0.03
+        and best["max_drawdown"] <= baseline["max_drawdown"] + 0.01
     ):
         return True
     return False
@@ -123,6 +148,12 @@ class Candidate:
     mix_struct_weight: float
     max_aggressive_size: float
     profile: str = "tilt_dynamic"
+    portfolio_min_weight: float = 0.05
+    portfolio_max_weight: float = 0.95
+    portfolio_weight_smoothing: float = 0.20
+    portfolio_turnover_penalty: float = 0.06
+    portfolio_vol_penalty: float = 1.2
+    portfolio_max_tilt: float = 0.16
     regime_enable: bool = False
     regime_lookahead_events: int = 18
     regime_label_quantile: float = 0.55
@@ -167,12 +198,29 @@ def candidates() -> List[Candidate]:
             regime_size_min_mult=0.60,
             regime_size_max_mult=1.10,
         ),
-        Candidate("crypto_tilt_baseline_mix_0_75", 0.75, 1.0, profile="tilt_dynamic"),
         Candidate(
-            "crypto_regime_soft_mix_0_75",
-            0.75,
-            1.0,
+            "crypto_tilt_baseline_mix_0_70",
+            0.70,
+            1.05,
             profile="tilt_dynamic",
+            portfolio_min_weight=0.05,
+            portfolio_max_weight=0.95,
+            portfolio_weight_smoothing=0.20,
+            portfolio_turnover_penalty=0.06,
+            portfolio_vol_penalty=1.2,
+            portfolio_max_tilt=0.16,
+        ),
+        Candidate(
+            "crypto_regime_soft_mix_0_70",
+            0.70,
+            1.05,
+            profile="tilt_dynamic",
+            portfolio_min_weight=0.08,
+            portfolio_max_weight=0.92,
+            portfolio_weight_smoothing=0.22,
+            portfolio_turnover_penalty=0.07,
+            portfolio_vol_penalty=1.3,
+            portfolio_max_tilt=0.15,
             regime_enable=True,
             regime_lookahead_events=18,
             regime_label_quantile=0.55,
@@ -184,25 +232,37 @@ def candidates() -> List[Candidate]:
             regime_size_max_mult=1.18,
         ),
         Candidate(
-            "crypto_regime_balanced_mix_0_70",
-            0.70,
+            "crypto_regime_balanced_mix_0_68",
+            0.68,
             1.0,
             profile="tilt_dynamic",
+            portfolio_min_weight=0.10,
+            portfolio_max_weight=0.90,
+            portfolio_weight_smoothing=0.24,
+            portfolio_turnover_penalty=0.08,
+            portfolio_vol_penalty=1.35,
+            portfolio_max_tilt=0.14,
             regime_enable=True,
-            regime_lookahead_events=18,
-            regime_label_quantile=0.57,
-            regime_p_cut=0.54,
-            regime_agg_p_cut=0.65,
-            regime_ev_scale=0.95,
-            regime_size_scale=0.35,
-            regime_size_min_mult=0.60,
-            regime_size_max_mult=1.20,
+            regime_lookahead_events=24,
+            regime_label_quantile=0.56,
+            regime_p_cut=0.53,
+            regime_agg_p_cut=0.64,
+            regime_ev_scale=0.85,
+            regime_size_scale=0.30,
+            regime_size_min_mult=0.65,
+            regime_size_max_mult=1.15,
         ),
         Candidate(
             "crypto_regime_defensive_mix_0_80",
             0.80,
             1.0,
             profile="tilt_dynamic",
+            portfolio_min_weight=0.18,
+            portfolio_max_weight=0.82,
+            portfolio_weight_smoothing=0.30,
+            portfolio_turnover_penalty=0.10,
+            portfolio_vol_penalty=1.55,
+            portfolio_max_tilt=0.10,
             regime_enable=True,
             regime_lookahead_events=24,
             regime_label_quantile=0.60,
@@ -218,6 +278,12 @@ def candidates() -> List[Candidate]:
             0.65,
             1.0,
             profile="tilt_dynamic",
+            portfolio_min_weight=0.12,
+            portfolio_max_weight=0.88,
+            portfolio_weight_smoothing=0.18,
+            portfolio_turnover_penalty=0.07,
+            portfolio_vol_penalty=1.25,
+            portfolio_max_tilt=0.14,
             regime_enable=True,
             regime_lookahead_events=12,
             regime_label_quantile=0.55,
@@ -227,6 +293,27 @@ def candidates() -> List[Candidate]:
             regime_size_scale=0.25,
             regime_size_min_mult=0.70,
             regime_size_max_mult=1.18,
+        ),
+        Candidate(
+            "crypto_regime_cash_preserve_mix_0_82",
+            0.82,
+            1.0,
+            profile="tilt_dynamic",
+            portfolio_min_weight=0.22,
+            portfolio_max_weight=0.78,
+            portfolio_weight_smoothing=0.34,
+            portfolio_turnover_penalty=0.10,
+            portfolio_vol_penalty=1.70,
+            portfolio_max_tilt=0.08,
+            regime_enable=True,
+            regime_lookahead_events=30,
+            regime_label_quantile=0.62,
+            regime_p_cut=0.58,
+            regime_agg_p_cut=0.70,
+            regime_ev_scale=1.20,
+            regime_size_scale=0.40,
+            regime_size_min_mult=0.50,
+            regime_size_max_mult=1.05,
         ),
     ]
 
@@ -311,21 +398,21 @@ def build_step3_cmd(
             "--portfolio-min-train-days",
             "252",
             "--portfolio-turnover-penalty",
-            "0.04",
+            str(c.portfolio_turnover_penalty),
             "--portfolio-weight-smoothing",
-            "0.15",
+            str(c.portfolio_weight_smoothing),
             "--portfolio-momentum-days",
             "63",
             "--portfolio-vol-days",
             "21",
             "--portfolio-vol-penalty",
-            "1.4",
+            str(c.portfolio_vol_penalty),
             "--portfolio-max-tilt",
-            "0.2",
+            str(c.portfolio_max_tilt),
             "--portfolio-min-weight",
-            "0.0",
+            str(c.portfolio_min_weight),
             "--portfolio-max-weight",
-            "0.005",
+            str(c.portfolio_max_weight),
         ]
     if c.regime_enable:
         cmd += [
@@ -383,7 +470,7 @@ def main() -> None:
     )
 
     rows: List[Dict[str, Any]] = []
-    best_row: Dict[str, Any] | None = None
+    robust_rows: List[Dict[str, Any]] = []
 
     for idx, c in enumerate(candidates(), start=1):
         run_dir = runs_root / f"{idx:02d}_{c.name}"
@@ -398,12 +485,28 @@ def main() -> None:
             start_capital=args.start_capital,
             c=c,
         )
-        run_cmd(cmd, cwd=repo_root, heartbeat_seconds=args.heartbeat_seconds)
-
-        summary_path = run_dir / "backtest" / "step3_summary.json"
-        summary = read_json(summary_path)
-        metrics = metric_snapshot(summary)
-        score = score_snapshot(metrics)
+        try:
+            run_cmd(cmd, cwd=repo_root, heartbeat_seconds=args.heartbeat_seconds)
+            summary_path = run_dir / "backtest" / "step3_summary.json"
+            summary = read_json(summary_path)
+            metrics = metric_snapshot(summary)
+            score = score_snapshot(metrics)
+            pass_robust, robust_failures = robust_pass(metrics)
+        except Exception as e:
+            row = {
+                "name": c.name,
+                "config": {
+                    "profile": c.profile,
+                    "mix_struct_weight": c.mix_struct_weight,
+                    "max_aggressive_size": c.max_aggressive_size,
+                },
+                "run_dir": str(run_dir),
+                "status": "error",
+                "error": str(e),
+            }
+            rows.append(row)
+            log(f"candidate={c.name} status=error error={e}")
+            continue
 
         row = {
             "name": c.name,
@@ -414,8 +517,12 @@ def main() -> None:
                 "portfolio_allocator": (
                     "equal_split" if c.profile == "balanced_equal" else "dynamic_regime_forced"
                 ),
-                "portfolio_min_weight": (None if c.profile == "balanced_equal" else 0.0),
-                "portfolio_max_weight": (None if c.profile == "balanced_equal" else 0.005),
+                "portfolio_min_weight": (None if c.profile == "balanced_equal" else c.portfolio_min_weight),
+                "portfolio_max_weight": (None if c.profile == "balanced_equal" else c.portfolio_max_weight),
+                "portfolio_weight_smoothing": (None if c.profile == "balanced_equal" else c.portfolio_weight_smoothing),
+                "portfolio_turnover_penalty": (None if c.profile == "balanced_equal" else c.portfolio_turnover_penalty),
+                "portfolio_vol_penalty": (None if c.profile == "balanced_equal" else c.portfolio_vol_penalty),
+                "portfolio_max_tilt": (None if c.profile == "balanced_equal" else c.portfolio_max_tilt),
                 "exclude_leaky_features": True,
                 "regime_model_enable": bool(c.regime_enable),
                 "regime_lookahead_events": int(c.regime_lookahead_events),
@@ -431,10 +538,12 @@ def main() -> None:
             "summary_path": str(summary_path),
             "metrics": metrics,
             "score": score,
+            "robust_pass": bool(pass_robust),
+            "robust_failures": robust_failures,
         }
         rows.append(row)
-        if best_row is None or float(row["score"]) > float(best_row["score"]):
-            best_row = row
+        if pass_robust:
+            robust_rows.append(row)
 
         log(
             f"candidate={c.name} "
@@ -442,11 +551,18 @@ def main() -> None:
             f"regime={'on' if c.regime_enable else 'off'} "
             f"avg_pnl={metrics['avg_monthly_pnl']:.2f} "
             f"calmar={metrics['calmar']:.4f} dd={metrics['max_drawdown']:.4f} "
-            f"score={score:.4f}"
+            f"score={score:.4f} robust={pass_robust}"
         )
 
-    if best_row is None:
+    if not rows:
         raise RuntimeError("No candidate results produced.")
+    valid_rows = [r for r in rows if ("score" in r and "metrics" in r)]
+    if not valid_rows:
+        raise RuntimeError("No successful candidate results produced.")
+    if robust_rows:
+        best_row = max(robust_rows, key=lambda r: float(r["score"]))
+    else:
+        best_row = max(valid_rows, key=lambda r: float(r["score"]))
 
     best_metrics = best_row["metrics"]
     promote = should_promote(best_metrics, baseline_metrics)
@@ -479,6 +595,7 @@ def main() -> None:
             "score": baseline_score,
         },
         "best_candidate": best_row,
+        "best_from_robust_pool": bool(best_row in robust_rows),
         "promoted_from": promoted_from,
         "promoted": bool(promote),
         "candidates": rows,

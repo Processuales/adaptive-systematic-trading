@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 APP = "BTC-ETH-HYBRID"
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 
 
 def log(msg: str) -> None:
@@ -389,16 +389,45 @@ def build_core_weight_series(
     core_mode: str,
     btc_share: float,
 ) -> pd.Series:
+    base_share = float(np.clip(btc_share, 0.0, 1.0))
     if core_mode == "fixed":
-        return pd.Series(float(np.clip(btc_share, 0.0, 1.0)), index=idx, dtype=float)
+        return pd.Series(base_share, index=idx, dtype=float)
     if core_mode == "vol_parity_6m":
         vb = btc_ret.rolling(6, min_periods=3).std().replace(0.0, np.nan)
         ve = eth_ret.rolling(6, min_periods=3).std().replace(0.0, np.nan)
         inv_b = 1.0 / vb
         inv_e = 1.0 / ve
         w = inv_b / (inv_b + inv_e)
-        w = w.reindex(idx).fillna(float(np.clip(btc_share, 0.0, 1.0)))
+        w = w.reindex(idx).fillna(base_share)
         return w.clip(lower=0.10, upper=0.90).astype(float)
+    if core_mode == "trend_guard_6m":
+        mom_b = btc_ret.rolling(6, min_periods=3).sum().reindex(idx)
+        mom_e = eth_ret.rolling(6, min_periods=3).sum().reindex(idx)
+        spread = (mom_b - mom_e).fillna(0.0)
+        spread_scale = spread.rolling(12, min_periods=6).std().replace(0.0, np.nan).fillna(0.15)
+        z = (spread / spread_scale).clip(lower=-3.0, upper=3.0)
+        w = base_share + 0.18 * np.tanh(z)
+        vb = btc_ret.rolling(6, min_periods=3).std().reindex(idx).fillna(0.0)
+        ve = eth_ret.rolling(6, min_periods=3).std().reindex(idx).fillna(0.0)
+        risk_off = (mom_b.fillna(0.0) < 0.0) & (vb > ve)
+        w = np.where(risk_off.to_numpy(bool), np.minimum(w, 0.35), w)
+        return pd.Series(w, index=idx, dtype=float).clip(lower=0.10, upper=0.90)
+    if core_mode == "risk_parity_mom_6m":
+        vb = btc_ret.rolling(6, min_periods=3).std().replace(0.0, np.nan)
+        ve = eth_ret.rolling(6, min_periods=3).std().replace(0.0, np.nan)
+        inv_b = 1.0 / vb
+        inv_e = 1.0 / ve
+        w_vp = (inv_b / (inv_b + inv_e)).reindex(idx).fillna(base_share).clip(lower=0.10, upper=0.90)
+        mom_b = btc_ret.rolling(6, min_periods=3).sum().reindex(idx)
+        mom_e = eth_ret.rolling(6, min_periods=3).sum().reindex(idx)
+        spread = (mom_b - mom_e).fillna(0.0)
+        spread_scale = spread.rolling(12, min_periods=6).std().replace(0.0, np.nan).fillna(0.15)
+        z = (spread / spread_scale).clip(lower=-3.0, upper=3.0)
+        w_m = (base_share + 0.12 * np.tanh(z)).clip(lower=0.10, upper=0.90)
+        w = (0.70 * w_vp + 0.30 * w_m).astype(float)
+        risk_off = (mom_b.fillna(0.0) < 0.0) & (vb.reindex(idx).fillna(0.0) > ve.reindex(idx).fillna(0.0))
+        w = np.where(risk_off.to_numpy(bool), np.minimum(w, 0.30), w)
+        return pd.Series(w, index=idx, dtype=float).clip(lower=0.10, upper=0.90)
     raise ValueError(f"Unsupported core mode: {core_mode}")
 
 
@@ -511,15 +540,38 @@ def should_promote(
     avg_monthly_pnl_margin: float,
     calmar_tolerance: float,
     drawdown_tolerance: float,
+    absolute_max_drawdown: float,
 ) -> bool:
-    if best["avg_monthly_pnl"] >= baseline["avg_monthly_pnl"] + avg_monthly_pnl_margin:
-        if best["calmar"] >= baseline["calmar"] - calmar_tolerance:
-            if best["max_drawdown"] <= baseline["max_drawdown"] + drawdown_tolerance:
-                return True
+    pnl_gain = float(best["avg_monthly_pnl"] - baseline["avg_monthly_pnl"])
+    if pnl_gain <= 0.0:
+        return False
+
+    abs_dd_cap = float(max(0.01, absolute_max_drawdown))
+    conservative_dd_gate = min(abs_dd_cap, baseline["max_drawdown"] + drawdown_tolerance)
+    high_gain_dd_gate = min(abs_dd_cap, baseline["max_drawdown"] + max(drawdown_tolerance, 0.08))
+
     if (
-        best["avg_monthly_pnl"] >= baseline["avg_monthly_pnl"]
+        pnl_gain >= avg_monthly_pnl_margin
+        and best["calmar"] >= baseline["calmar"] - calmar_tolerance
+        and best["max_drawdown"] <= conservative_dd_gate
+    ):
+        return True
+
+    # If baseline is weak/negative, permit measured drawdown expansion only when
+    # gains are large and robustness tails are still positive.
+    if (
+        pnl_gain >= max(3.0 * avg_monthly_pnl_margin, 40.0)
+        and best["calmar"] >= baseline["calmar"] - max(calmar_tolerance, 0.0)
+        and best["max_drawdown"] <= high_gain_dd_gate
+        and best["stress_1_25_avg_monthly_pnl"] > 0.0
+        and best["bootstrap_p10_avg_monthly_pnl"] > 0.0
+    ):
+        return True
+
+    if (
+        pnl_gain >= max(6.0 * avg_monthly_pnl_margin, 80.0)
         and best["calmar"] >= baseline["calmar"]
-        and best["max_drawdown"] <= baseline["max_drawdown"] + 0.02
+        and best["max_drawdown"] <= abs_dd_cap
     ):
         return True
     return False
@@ -531,6 +583,7 @@ def pick_best_promotable_candidate(
     avg_monthly_pnl_margin: float,
     calmar_tolerance: float,
     drawdown_tolerance: float,
+    absolute_max_drawdown: float,
 ) -> Dict[str, Any] | None:
     if not robust_rows:
         return None
@@ -543,6 +596,7 @@ def pick_best_promotable_candidate(
             avg_monthly_pnl_margin=avg_monthly_pnl_margin,
             calmar_tolerance=calmar_tolerance,
             drawdown_tolerance=drawdown_tolerance,
+            absolute_max_drawdown=absolute_max_drawdown,
         ):
             return row
     return None
@@ -712,21 +766,22 @@ def main() -> None:
     ap.add_argument("--step3-out-dir", required=True)
     ap.add_argument("--alias-dir", required=True)
     ap.add_argument("--start-capital", type=float, default=10000.0)
-    ap.add_argument("--core-fractions", default="0.30,0.50,0.70,0.85")
+    ap.add_argument("--core-fractions", default="0.20,0.30,0.50,0.70,0.85")
     ap.add_argument("--core-btc-shares", default="0.30,0.50,0.70,0.85")
-    ap.add_argument("--active-scales", default="1.00,0.80,0.60")
-    ap.add_argument("--core-modes", default="fixed,vol_parity_6m")
+    ap.add_argument("--active-scales", default="1.00,0.80,0.60,0.40,0.25,0.15")
+    ap.add_argument("--core-modes", default="fixed,vol_parity_6m,trend_guard_6m,risk_parity_mom_6m")
     ap.add_argument("--bootstrap-samples", type=int, default=800)
     ap.add_argument("--bootstrap-block-months", type=int, default=6)
     ap.add_argument("--bootstrap-seed", type=int, default=42)
     ap.add_argument("--min-stress125-avg-monthly-pnl", type=float, default=0.0)
     ap.add_argument("--min-stress150-avg-monthly-pnl", type=float, default=0.0)
     ap.add_argument("--min-bootstrap-p10-monthly-pnl", type=float, default=0.0)
-    ap.add_argument("--max-drawdown-cap", type=float, default=0.35)
+    ap.add_argument("--max-drawdown-cap", type=float, default=0.22)
     ap.add_argument("--min-active-sleeve-share", type=float, default=0.05)
-    ap.add_argument("--promote-avg-monthly-pnl-margin", type=float, default=8.0)
+    ap.add_argument("--promote-avg-monthly-pnl-margin", type=float, default=5.0)
     ap.add_argument("--promote-calmar-tolerance", type=float, default=0.05)
-    ap.add_argument("--promote-drawdown-tolerance", type=float, default=0.03)
+    ap.add_argument("--promote-drawdown-tolerance", type=float, default=0.02)
+    ap.add_argument("--promote-absolute-max-drawdown", type=float, default=0.20)
     ap.add_argument("--no-promote", action="store_true")
     args = ap.parse_args()
 
@@ -919,6 +974,7 @@ def main() -> None:
             avg_monthly_pnl_margin=args.promote_avg_monthly_pnl_margin,
             calmar_tolerance=args.promote_calmar_tolerance,
             drawdown_tolerance=args.promote_drawdown_tolerance,
+            absolute_max_drawdown=args.promote_absolute_max_drawdown,
         )
         if promote_row is not None and promote_row["name"] != best["name"]:
             log(
@@ -958,10 +1014,11 @@ def main() -> None:
                 "min_bootstrap_p10_monthly_pnl": float(args.min_bootstrap_p10_monthly_pnl),
                 "max_drawdown_cap": float(args.max_drawdown_cap),
                 "min_active_sleeve_share": float(args.min_active_sleeve_share),
+                "promote_absolute_max_drawdown": float(args.promote_absolute_max_drawdown),
             },
             "promotion_rule": (
-                "Promote only if robust gates pass and hybrid improves monthly PnL meaningfully "
-                "without material calmar/drawdown degradation."
+                "Promote only if robust gates pass; allow measured drawdown expansion for large "
+                "PnL gains, but never above promote_absolute_max_drawdown."
             ),
         },
         "baseline": {

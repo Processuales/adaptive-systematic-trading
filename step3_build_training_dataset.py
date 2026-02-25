@@ -12,14 +12,14 @@ import argparse
 import json
 import os
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
 import step2_build_events_dataset as s2
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.2.0"
 
 
 def ensure_dir(path: str) -> None:
@@ -63,9 +63,10 @@ def build_symbol_events(
     trade_symbol: str,
     cross_symbol: str,
     knobs: s2.Knobs,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
     tol = pd.Timedelta(knobs.cross_merge_tolerance)
     trade_bars = bars_by_sym[trade_symbol].copy()
+    cross_diag: Dict[str, float] = {}
 
     if knobs.include_cross_asset:
         trade_bars = s2.build_cross_features(
@@ -74,19 +75,25 @@ def build_symbol_events(
             cross_symbol=cross_symbol,
             tolerance=tol,
         )
+        cross_diag = s2.cross_alignment_diagnostics(trade_bars, cross_symbol, tol)
 
     events = s2.build_event_dataset(trade_bars, trade_symbol, knobs)
     if events.empty:
-        return events
+        return events, cross_diag
 
     if knobs.include_cross_asset:
         cross_sym_l = cross_symbol.lower()
         desired = [
             f"{cross_sym_l}_sigma",
             f"{cross_sym_l}_u_atr",
+            f"{cross_sym_l}_sigma_prank",
+            f"{cross_sym_l}_u_atr_prank",
             f"{cross_sym_l}_trend_score",
             f"{cross_sym_l}_pullback_z",
             f"{cross_sym_l}_vol_z",
+            f"{cross_sym_l}_gap_sd",
+            f"{cross_sym_l}_gap_tail",
+            f"{cross_sym_l}_intraday_tail_frac",
             f"{cross_sym_l}_range_ratio",
             f"{cross_sym_l}_ema_fast_slope",
             f"{cross_sym_l}_age_min",
@@ -111,7 +118,7 @@ def build_symbol_events(
     events["y_loss"] = 1 - events["y"].astype(int)
     events["hold_bars"] = (events["label_end_idx"] - (events["t_idx"] + 1)).clip(lower=0)
     events["decision_month"] = events["decision_time_utc"].dt.strftime("%Y-%m")
-    return events.reset_index(drop=True)
+    return events.reset_index(drop=True), cross_diag
 
 
 def infer_feature_columns(events_all: pd.DataFrame) -> List[str]:
@@ -130,6 +137,41 @@ def infer_feature_columns(events_all: pd.DataFrame) -> List[str]:
     return sorted(feats)
 
 
+def validate_cross_alignment(
+    alignment: Dict[str, Dict[str, float]],
+    min_match_rate: float,
+    max_lookahead_rate: float,
+    max_stale_over_tolerance_rate: float,
+    max_stale_over_bar_rate: float,
+) -> Dict[str, Dict[str, object]]:
+    report: Dict[str, Dict[str, object]] = {}
+    for name, diag in alignment.items():
+        match_rate = float(diag.get("match_rate") or 0.0)
+        lookahead_rate = float(diag.get("lookahead_rate") or 0.0)
+        stale_tol_rate = float(diag.get("stale_over_tolerance_rate") or 0.0)
+        stale_bar_rate = float(diag.get("stale_over_bar_rate") or 0.0)
+        issues: List[str] = []
+        if match_rate < float(min_match_rate):
+            issues.append(f"match_rate {match_rate:.6f} < {float(min_match_rate):.6f}")
+        if lookahead_rate > float(max_lookahead_rate):
+            issues.append(f"lookahead_rate {lookahead_rate:.6f} > {float(max_lookahead_rate):.6f}")
+        if stale_tol_rate > float(max_stale_over_tolerance_rate):
+            issues.append(
+                f"stale_over_tolerance_rate {stale_tol_rate:.6f} > {float(max_stale_over_tolerance_rate):.6f}"
+            )
+        if stale_bar_rate > float(max_stale_over_bar_rate):
+            issues.append(f"stale_over_bar_rate {stale_bar_rate:.6f} > {float(max_stale_over_bar_rate):.6f}")
+        report[name] = {
+            "passed": len(issues) == 0,
+            "match_rate": match_rate,
+            "lookahead_rate": lookahead_rate,
+            "stale_over_tolerance_rate": stale_tol_rate,
+            "stale_over_bar_rate": stale_bar_rate,
+            "issues": issues,
+        }
+    return report
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", required=True, help="Directory with cleaned 1h parquet bars")
@@ -137,6 +179,10 @@ def main() -> None:
     ap.add_argument("--bar-file-suffix", default="_1h_rth_clean.parquet")
     ap.add_argument("--symbols", nargs="+", default=["SPY", "QQQ"])
     ap.add_argument("--cross-tolerance", default="30min")
+    ap.add_argument("--cross-min-match-rate", type=float, default=0.995)
+    ap.add_argument("--cross-max-lookahead-rate", type=float, default=0.0)
+    ap.add_argument("--cross-max-stale-over-tolerance-rate", type=float, default=0.01)
+    ap.add_argument("--cross-max-stale-over-bar-rate", type=float, default=0.05)
     ap.add_argument("--same-bar-policy", choices=["worst", "best", "close_direction"], default="worst")
     ap.add_argument(
         "--friction-profile",
@@ -182,13 +228,13 @@ def main() -> None:
             bars_by_sym[sym]["is_weekend"] = bars_by_sym[sym]["date"].dt.dayofweek.isin([5, 6]).astype(int)
         print("[24/7] Disabled entry_overnight; added is_weekend feature.")
 
-    q_events = build_symbol_events(
+    q_events, q_cross_diag = build_symbol_events(
         bars_by_sym=bars_by_sym,
         trade_symbol="QQQ",
         cross_symbol="SPY",
         knobs=knobs,
     )
-    s_events = build_symbol_events(
+    s_events, s_cross_diag = build_symbol_events(
         bars_by_sym=bars_by_sym,
         trade_symbol="SPY",
         cross_symbol="QQQ",
@@ -196,6 +242,33 @@ def main() -> None:
     )
     if q_events.empty or s_events.empty:
         raise RuntimeError("Step 3 dataset build produced empty events for at least one symbol.")
+
+    cross_alignment = {
+        "qqq_from_spy": q_cross_diag,
+        "spy_from_qqq": s_cross_diag,
+    }
+    cross_checks = validate_cross_alignment(
+        alignment=cross_alignment,
+        min_match_rate=float(args.cross_min_match_rate),
+        max_lookahead_rate=float(args.cross_max_lookahead_rate),
+        max_stale_over_tolerance_rate=float(args.cross_max_stale_over_tolerance_rate),
+        max_stale_over_bar_rate=float(args.cross_max_stale_over_bar_rate),
+    )
+    failures: List[str] = []
+    for name, row in cross_checks.items():
+        print(
+            "[STEP3-DATA] CROSS "
+            f"{name} passed={bool(row.get('passed'))} "
+            f"match={float(row.get('match_rate') or 0.0):.6f} "
+            f"lookahead={float(row.get('lookahead_rate') or 0.0):.6f} "
+            f"stale_tol={float(row.get('stale_over_tolerance_rate') or 0.0):.6f} "
+            f"stale_bar={float(row.get('stale_over_bar_rate') or 0.0):.6f}"
+        )
+        if not bool(row.get("passed")):
+            for issue in row.get("issues") or []:
+                failures.append(f"{name}: {issue}")
+    if failures:
+        raise RuntimeError("Cross-alignment validation failed: " + "; ".join(failures))
 
     q_path = os.path.join(dataset_dir, "qqq_events_step3.parquet")
     s_path = os.path.join(dataset_dir, "spy_events_step3.parquet")
@@ -229,6 +302,16 @@ def main() -> None:
             "qqq_end_utc": str(q_events["decision_time_utc"].max()),
             "spy_start_utc": str(s_events["decision_time_utc"].min()),
             "spy_end_utc": str(s_events["decision_time_utc"].max()),
+        },
+        "cross_alignment": cross_alignment,
+        "cross_alignment_validation": {
+            "thresholds": {
+                "min_match_rate": float(args.cross_min_match_rate),
+                "max_lookahead_rate": float(args.cross_max_lookahead_rate),
+                "max_stale_over_tolerance_rate": float(args.cross_max_stale_over_tolerance_rate),
+                "max_stale_over_bar_rate": float(args.cross_max_stale_over_bar_rate),
+            },
+            "checks": cross_checks,
         },
         "feature_columns": feature_cols,
         "outputs": {

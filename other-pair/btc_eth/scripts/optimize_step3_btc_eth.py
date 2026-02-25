@@ -97,6 +97,24 @@ def metric_snapshot(summary: Dict[str, Any]) -> Dict[str, float]:
     }
 
 
+def is_degenerate_metrics(
+    metrics: Dict[str, float],
+    start_capital: float,
+    min_avg_monthly_trades: float = 0.05,
+) -> bool:
+    avg_pnl = float(metrics.get("avg_monthly_pnl") or 0.0)
+    avg_trades = float(metrics.get("avg_monthly_trades") or 0.0)
+    end_equity = float(metrics.get("end_equity") or 0.0)
+    max_dd = float(metrics.get("max_drawdown") or 0.0)
+    if avg_trades <= float(min_avg_monthly_trades):
+        return True
+    if abs(avg_pnl) <= 1e-9 and abs(end_equity - float(start_capital)) <= 1e-6:
+        return True
+    if max_dd >= 0.99:
+        return True
+    return False
+
+
 def score_snapshot(m: Dict[str, float]) -> float:
     return float(
         0.55 * m["avg_monthly_pnl"]
@@ -163,6 +181,8 @@ class Candidate:
     regime_size_scale: float = 0.30
     regime_size_min_mult: float = 0.60
     regime_size_max_mult: float = 1.20
+    tail_q10_cut: float = -0.015
+    tail_agg_q10_cut: float = -0.010
 
 
 def candidates() -> List[Candidate]:
@@ -347,6 +367,10 @@ def build_step3_cmd(
         "--portfolio-no-spy-guard",
         "--spy-drift-kill-switch",
         "none",
+        "--tail-q10-cut",
+        str(c.tail_q10_cut),
+        "--tail-agg-q10-cut",
+        str(c.tail_agg_q10_cut),
     ]
     if c.profile == "balanced_equal":
         cmd += [
@@ -533,6 +557,8 @@ def main() -> None:
                 "regime_size_scale": float(c.regime_size_scale),
                 "regime_size_min_mult": float(c.regime_size_min_mult),
                 "regime_size_max_mult": float(c.regime_size_max_mult),
+                "tail_q10_cut": float(c.tail_q10_cut),
+                "tail_agg_q10_cut": float(c.tail_agg_q10_cut),
             },
             "run_dir": str(run_dir),
             "summary_path": str(summary_path),
@@ -559,10 +585,22 @@ def main() -> None:
     valid_rows = [r for r in rows if ("score" in r and "metrics" in r)]
     if not valid_rows:
         raise RuntimeError("No successful candidate results produced.")
-    if robust_rows:
+    nondeg_valid_rows = [
+        r for r in valid_rows if not is_degenerate_metrics(r["metrics"], start_capital=args.start_capital)
+    ]
+    nondeg_robust_rows = [
+        r for r in robust_rows if not is_degenerate_metrics(r["metrics"], start_capital=args.start_capital)
+    ]
+    if nondeg_robust_rows:
+        best_row = max(nondeg_robust_rows, key=lambda r: float(r["score"]))
+    elif nondeg_valid_rows:
+        best_row = max(nondeg_valid_rows, key=lambda r: float(r["score"]))
+    elif robust_rows:
         best_row = max(robust_rows, key=lambda r: float(r["score"]))
+        log("WARN: all robust candidates are degenerate; selecting highest-score robust fallback.")
     else:
         best_row = max(valid_rows, key=lambda r: float(r["score"]))
+        log("WARN: all candidates are degenerate; selecting highest-score fallback.")
 
     best_metrics = best_row["metrics"]
     promote = should_promote(best_metrics, baseline_metrics)
@@ -588,6 +626,12 @@ def main() -> None:
             "start_capital": float(args.start_capital),
             "promotion_rule": "promote if avg_monthly_pnl improves by >=10 OR "
             "avg_pnl+calmar improve with no material drawdown increase",
+            "selection_counts": {
+                "valid_candidates": int(len(valid_rows)),
+                "robust_candidates": int(len(robust_rows)),
+                "nondeg_valid_candidates": int(len(nondeg_valid_rows)),
+                "nondeg_robust_candidates": int(len(nondeg_robust_rows)),
+            },
         },
         "baseline": {
             "summary_path": str(baseline_summary_path),

@@ -23,7 +23,7 @@ import pandas as pd
 
 import step2_build_events_dataset as s2
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 
 
 def ensure_dir(path: str) -> None:
@@ -491,10 +491,13 @@ def evaluate_trial(
         "u_atr",
         "sigma_prank",
         "u_atr_prank",
+        "gap_mu",
         "gap_sd",
         "gap_tail",
         "vol_z",
         "dist_to_hi",
+        "ema_fast_slope",
+        "intraday_tail_frac",
         "range_ratio",
         "tp_to_cost",
         "ret_spread",

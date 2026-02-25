@@ -34,3 +34,14 @@ other-pair/*/final output/dual ml/
 *.7z
 *.feather
 *.h5
+
+# Local experimentation / smoke artifacts
+_smoke_step3_out*/
+focused_runs/
+other-pair/*/focused_runs/
+other-pair/*/quick_test/
+
+# Ephemeral snapshots
+final output/step3/step3_dual_portfolio_curve.png
+final output/step3/step3_final_snapshot.json
+final output/step3/step3_summary.json

@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 APP = "BTC-ETH-HYBRID"
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.3.0"
 
 
 def log(msg: str) -> None:
@@ -342,6 +342,24 @@ def metric_snapshot(summary: Dict[str, Any]) -> Dict[str, float]:
         "stress_1_50_avg_monthly_pnl": float(s150.get("avg_monthly_pnl") or 0.0),
         "bootstrap_p10_avg_monthly_pnl": float(boot_avg.get("p10") or 0.0),
     }
+
+
+def is_degenerate_metrics(
+    metrics: Dict[str, float],
+    start_capital: float,
+    min_avg_monthly_trades: float = 0.05,
+) -> bool:
+    avg_pnl = float(metrics.get("avg_monthly_pnl") or 0.0)
+    avg_trades = float(metrics.get("avg_monthly_trades") or 0.0)
+    end_equity = float(metrics.get("end_equity") or 0.0)
+    max_dd = float(metrics.get("max_drawdown") or 0.0)
+    if avg_trades <= float(min_avg_monthly_trades):
+        return True
+    if abs(avg_pnl) <= 1e-9 and abs(end_equity - float(start_capital)) <= 1e-6:
+        return True
+    if max_dd >= 0.99:
+        return True
+    return False
 
 
 def score_snapshot(m: Dict[str, float]) -> float:
@@ -704,6 +722,10 @@ def promote_into_backtest(
     p["avg_monthly_trades"] = best_metrics["avg_monthly_trades"]
     p["monthly_positive_rate"] = best_metrics["monthly_positive_rate"]
     p["monthly_negative_rate"] = best_metrics["monthly_negative_rate"]
+    monthly_norm = normalize_monthly(promoted_monthly)
+    total_trades = float(monthly_norm["trades"].sum()) if not monthly_norm.empty else 0.0
+    p["total_trades"] = int(round(total_trades))
+    p["zero_trade_month_rate"] = float((monthly_norm["trades"] <= 0.0).mean()) if not monthly_norm.empty else 1.0
     p["best_month"] = best_row["best_month"]
     p["worst_month"] = best_row["worst_month"]
     p["cost_stress_tests"] = best_row["cost_stress_tests"]
@@ -761,6 +783,22 @@ def promote_into_backtest(
         json.dump(round_obj(s, 6), f, separators=(",", ":"), ensure_ascii=True)
 
 
+def restore_active_baseline_backtest(step3_out_dir: Path) -> bool:
+    backup_dir = step3_out_dir / "backtest_active_baseline"
+    src_summary = backup_dir / "step3_summary_active.json"
+    src_monthly = backup_dir / "step3_monthly_table_active.parquet"
+    src_plot = backup_dir / "step3_dual_portfolio_curve_active.png"
+    if not src_summary.exists() or not src_monthly.exists():
+        return False
+    backtest_dir = step3_out_dir / "backtest"
+    backtest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_summary, backtest_dir / "step3_summary.json")
+    shutil.copy2(src_monthly, backtest_dir / "step3_monthly_table.parquet")
+    if src_plot.exists():
+        shutil.copy2(src_plot, backtest_dir / "step3_dual_portfolio_curve.png")
+    return True
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--step3-out-dir", required=True)
@@ -793,32 +831,82 @@ def main() -> None:
     baseline_summary_path = backtest_dir / "step3_summary.json"
     baseline_monthly_path = backtest_dir / "step3_monthly_table.parquet"
     baseline_source = "backtest"
+    baseline_source_rejections: List[str] = []
+    selected_baseline_metrics: Dict[str, float] | None = None
 
     # Preferred source: tuned active-only run from BTC/ETH tilt report.
     if tilt_report_path.exists():
         try:
             tilt_report = read_json(tilt_report_path)
-            best = tilt_report.get("best_candidate") or {}
-            s_path = Path(str(best.get("summary_path") or "")).resolve()
-            m_path = s_path.parent / "step3_monthly_table.parquet"
-            if s_path.exists() and m_path.exists():
+            preferred_rows: List[tuple[str, Dict[str, Any]]] = []
+            robust_best = tilt_report.get("best_from_robust_pool")
+            if isinstance(robust_best, dict):
+                preferred_rows.append(("tilt_best_robust_candidate", robust_best))
+            best = tilt_report.get("best_candidate")
+            if isinstance(best, dict):
+                preferred_rows.append(("tilt_best_candidate", best))
+            for source_name, row in preferred_rows:
+                s_path = Path(str(row.get("summary_path") or "")).resolve()
+                m_path = s_path.parent / "step3_monthly_table.parquet"
+                if not s_path.exists() or not m_path.exists():
+                    baseline_source_rejections.append(f"{source_name}: missing summary/monthly paths")
+                    continue
+                cand_metrics = row.get("metrics") or {}
+                if not cand_metrics:
+                    try:
+                        cand_metrics = metric_snapshot(read_json(s_path))
+                    except Exception as e:
+                        baseline_source_rejections.append(f"{source_name}: metric read failed ({e})")
+                        continue
+                if is_degenerate_metrics(cand_metrics, start_capital=args.start_capital):
+                    baseline_source_rejections.append(f"{source_name}: rejected degenerate metrics")
+                    continue
                 baseline_summary_path = s_path
                 baseline_monthly_path = m_path
-                baseline_source = "tilt_best_candidate"
-        except Exception:
-            pass
+                baseline_source = source_name
+                selected_baseline_metrics = cand_metrics
+                break
+        except Exception as e:
+            baseline_source_rejections.append(f"tilt_report read failed ({e})")
 
-    # Fallback source: preserved active baseline snapshot.
-    if baseline_source == "backtest":
-        if (
-            (active_baseline_dir / "step3_summary_active.json").exists()
-            and (active_baseline_dir / "step3_monthly_table_active.parquet").exists()
-        ):
-            baseline_summary_path = active_baseline_dir / "step3_summary_active.json"
-            baseline_monthly_path = active_baseline_dir / "step3_monthly_table_active.parquet"
-            baseline_source = "backtest_active_baseline"
+    # Evaluate preserved active baseline snapshot; prefer it when stronger.
+    if (
+        (active_baseline_dir / "step3_summary_active.json").exists()
+        and (active_baseline_dir / "step3_monthly_table_active.parquet").exists()
+    ):
+        s_path = active_baseline_dir / "step3_summary_active.json"
+        m_path = active_baseline_dir / "step3_monthly_table_active.parquet"
+        try:
+            active_metrics = metric_snapshot(read_json(s_path))
+            if is_degenerate_metrics(active_metrics, start_capital=args.start_capital):
+                baseline_source_rejections.append("backtest_active_baseline: rejected degenerate metrics")
+            elif baseline_source == "backtest":
+                baseline_summary_path = s_path
+                baseline_monthly_path = m_path
+                baseline_source = "backtest_active_baseline"
+                selected_baseline_metrics = active_metrics
+            elif selected_baseline_metrics is not None:
+                score_selected = score_snapshot(selected_baseline_metrics)
+                score_active = score_snapshot(active_metrics)
+                if score_active > score_selected:
+                    baseline_source_rejections.append(
+                        f"{baseline_source}: superseded by backtest_active_baseline ({score_selected:.4f} -> {score_active:.4f})"
+                    )
+                    baseline_summary_path = s_path
+                    baseline_monthly_path = m_path
+                    baseline_source = "backtest_active_baseline"
+                    selected_baseline_metrics = active_metrics
+                else:
+                    baseline_source_rejections.append(
+                        f"backtest_active_baseline: lower score than {baseline_source} ({score_active:.4f} <= {score_selected:.4f})"
+                    )
+        except Exception as e:
+            baseline_source_rejections.append(f"backtest_active_baseline: metric read failed ({e})")
     if not baseline_summary_path.exists() or not baseline_monthly_path.exists():
         raise FileNotFoundError("Missing baseline Step 3 summary/monthly table for hybrid overlay.")
+    for r in baseline_source_rejections:
+        log(f"baseline source reject: {r}")
+    log(f"baseline source selected: {baseline_source}")
 
     active_summary = read_json(baseline_summary_path)
     active_monthly = normalize_monthly(pd.read_parquet(baseline_monthly_path))
@@ -997,6 +1085,10 @@ def main() -> None:
         promoted_from = str(row["name"])
         log(f"promoted candidate -> step3_out/backtest: {row['name']}")
     else:
+        if baseline_source == "backtest_active_baseline":
+            restored = restore_active_baseline_backtest(step3_out_dir)
+            if restored:
+                log("restored step3_out/backtest from backtest_active_baseline snapshot")
         log("no promotion: active baseline remains selected")
 
     report = {
@@ -1008,6 +1100,7 @@ def main() -> None:
             "alias_dir": str(alias_dir),
             "start_capital": float(args.start_capital),
             "baseline_source": baseline_source,
+            "baseline_source_rejections": baseline_source_rejections,
             "gates": {
                 "min_stress125_avg_monthly_pnl": float(args.min_stress125_avg_monthly_pnl),
                 "min_stress150_avg_monthly_pnl": float(args.min_stress150_avg_monthly_pnl),

@@ -256,10 +256,15 @@ def write_compact_final_report(final_dir: Path, step3_out: Path, start_capital: 
     promoted = bool(hybrid_report.get("promoted"))
     best_row = hybrid_report.get("best_candidate") or {}
     best_promotable_row = hybrid_report.get("best_promotable_candidate") or {}
+    baseline_row = hybrid_report.get("baseline") or {}
     selected_row = best_promotable_row if (promoted and best_promotable_row) else best_row
     selected_name = hybrid_report.get("promoted_from") if promoted else "active_baseline"
     if not selected_name and selected_row:
         selected_name = selected_row.get("name")
+    if promoted:
+        selected_metrics = (selected_row or {}).get("metrics")
+    else:
+        selected_metrics = baseline_row.get("metrics") or (old.get("snapshots") or {}).get("step3_real_ml")
 
     compact = {
         "meta": {
@@ -288,7 +293,7 @@ def write_compact_final_report(final_dir: Path, step3_out: Path, start_capital: 
                 "best_candidate": best_row.get("name"),
                 "best_metrics": best_row.get("metrics"),
                 "selected_candidate": selected_name,
-                "selected_metrics": (selected_row or {}).get("metrics"),
+                "selected_metrics": selected_metrics,
             }
             if hybrid_report
             else None,
@@ -624,6 +629,8 @@ def main() -> None:
                 "QQQ",
                 "--trade-symbol",
                 "QQQ",
+                "--same-bar-policy",
+                "worst",
                 "--friction-profile",
                 "crypto",
                 "--market-hours",
@@ -728,6 +735,8 @@ def main() -> None:
                 str(clean_alias_dir),
                 "--out-dir",
                 str(step3_out),
+                "--same-bar-policy",
+                "worst",
                 "--friction-profile",
                 "crypto",
                 "--market-hours",

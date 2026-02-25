@@ -350,3 +350,93 @@ For this setup, gains increase from:
 If you want a single "smarter algorithm" upgrade later:
 * Quantile regression with boosted trees.
 * Gate on $Q_{0.1}(\Delta^{net} | x) > 0$.
+
+---
+
+## 15. Focused Remediation Pass (2026-02-25 UTC)
+
+### 15.1 Scope Executed
+* Audited SPY/QQQ and BTC/ETH training + optimization + final reporting paths.
+* Excluded IBIT/ETHA side pair.
+* Implemented and validated fixes for:
+  * Cross-asset alignment validation (hard fail instead of soft warning).
+  * Same-bar policy enforcement at `worst` in dataset builds used by pipeline runs.
+  * BTC/ETH hybrid baseline source selection and stale/degenerate source rejection.
+  * BTC/ETH hybrid no-promotion behavior (restore active baseline snapshot into `step3_out/backtest`).
+  * Final report snapshots now include drawdown/calmar/trade totals for easier run-to-run diagnostics.
+
+### 15.2 Root Causes Found
+* BTC/ETH hybrid baseline source could prefer `tilt_best_candidate` whenever report existed, even when candidate was degenerate/stale (e.g., zero-trade profile).
+* Hybrid no-promotion path logged "active baseline remains selected" but did not actually restore active baseline files into backtest.
+* Final compact metrics previously caused ambiguity because key risk fields were missing from `step3_real_ml` snapshot.
+* Cross-asset alignment checks were computed but not enforced as hard gates during Step 3 dataset build.
+
+### 15.3 Code Changes
+* `step3_build_training_dataset.py`
+  * Added cross-alignment hard validation thresholds and fail-fast behavior.
+  * Added `cross_alignment_validation` block to dataset metadata.
+  * Added explicit cross-check printouts for `match/lookahead/stale`.
+* `run_step2_step3_final.py`
+  * Upgraded snapshot payloads to include `median_monthly_pnl`, `cagr`, `max_drawdown`, `calmar`, and `total_trades`.
+* `other-pair/btc_eth/scripts/optimize_step3_btc_eth.py`
+  * Added non-degenerate candidate filter for best-candidate selection.
+  * Added selection-count diagnostics in report metadata.
+* `other-pair/btc_eth/scripts/optimize_step3_hybrid_btc_eth.py`
+  * Added degenerate baseline rejection logic.
+  * Added source scoring logic to let `backtest_active_baseline` supersede weak tilt candidates.
+  * Added baseline source rejection audit trail in report metadata.
+  * Added no-promotion restore path to copy `backtest_active_baseline` artifacts back into active `backtest`.
+  * Added portfolio trade consistency updates (`total_trades`, `zero_trade_month_rate`) during promotion.
+
+### 15.4 Data Alignment Verification
+* SPY/QQQ dataset meta (`step3_out/dataset/step3_dataset_meta.json`):
+  * `same_bar_policy = worst`
+  * `qqq_from_spy match_rate = 1.000000`, `lookahead_rate = 0.000000`
+  * `spy_from_qqq match_rate = 0.999603`, `lookahead_rate = 0.000000`
+  * Validation checks: pass.
+* BTC/ETH alias dataset meta (`other-pair/btc_eth/step3_out/dataset/step3_dataset_meta.json`):
+  * `same_bar_policy = worst`
+  * `qqq_from_spy match_rate = 1.000000`, `lookahead_rate = 0.000000`
+  * `spy_from_qqq match_rate = 1.000000`, `lookahead_rate = 0.000000`
+  * Validation checks: pass.
+
+### 15.5 Rerun Results
+Baseline reference used for comparison: `docs/upgrade_results_2026-02-24.json` (`generated_utc=2026-02-24T22:09:53.804323Z`).
+
+SPY/QQQ:
+* Previous: `avg_monthly_pnl=76.193111`, `max_drawdown=0.105611`, `calmar=0.671465`, `avg_monthly_trades=7.154639`
+* Current (`final output/reports/final_output_summary.json`, `generated_utc=2026-02-25T00:28:15.110102+00:00`):
+  * `avg_monthly_pnl=74.180121`
+  * `max_drawdown=0.120407`
+  * `calmar=0.576529`
+  * `avg_monthly_trades=7.134021`
+  * `total_trades=692`
+
+BTC/ETH:
+* Previous: `avg_monthly_pnl=146.624268`, `max_drawdown=0.208737`, `calmar=0.564077`, `avg_monthly_trades=0.0`
+* Current (`other-pair/btc_eth/final output/reports/final_output_summary.json`, `generated_utc=2026-02-25T06:58:54.797104+00:00`):
+  * `avg_monthly_pnl=539.797`
+  * `max_drawdown=0.322384`
+  * `calmar=0.807148`
+  * `avg_monthly_trades=16.305263`
+  * `total_trades=1549`
+* Hybrid overlay report (`other-pair/btc_eth/step3_out/optimization/btc_eth_hybrid_overlay_report.json`, `generated_utc=2026-02-25T06:58:42.908773+00:00`):
+  * `baseline_source=backtest_active_baseline`
+  * `baseline_source_rejections` documents tilt candidate supersession.
+  * `promoted=false` (best hybrid candidate had much higher drawdown).
+
+### 15.6 Success Assessment
+* Issue-level success: yes.
+  * Zero-trade BTC/ETH reporting artifact is fixed.
+  * Cross-asset lookahead/stale joining is now explicitly gated and verified.
+  * Hybrid baseline source selection is now robust and traceable.
+* Performance-goal success: mixed.
+  * SPY/QQQ performance softened versus previous focused snapshot.
+  * BTC/ETH PnL improved materially and trade count is realistic, but drawdown is materially higher than 20%.
+* Deployability status:
+  * SPY/QQQ: deployable from data-integrity standpoint; risk/return needs further tuning.
+  * BTC/ETH: now operationally coherent (non-zero trades), but drawdown profile is still too high for conservative deployment.
+
+### 15.7 Artifact
+* Consolidated fix-pass comparison JSON:
+  * `docs/fix_pass_results_2026-02-25.json`

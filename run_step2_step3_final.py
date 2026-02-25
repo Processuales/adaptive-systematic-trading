@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-SCRIPT_VERSION = "1.5.0"
+SCRIPT_VERSION = "1.6.0"
 
 
 def ensure_dir(path: str) -> None:
@@ -184,6 +184,7 @@ def make_step2_chart(
     avg_pnl = float(pnl_stats.get("avg_monthly_pnl") or 0.0)
     med_pnl = float(pnl_stats.get("median_monthly_pnl") or 0.0)
     avg_tpm = float(trades.get("avg_monthly_trades") or 0.0)
+    total_trades = int(trades.get("total_trades") or 0)
     end_eq = float(perf.get("end_equity") or start_capital)
     cagr = float(perf.get("cagr") or 0.0)
     mdd = float(perf.get("max_drawdown") or 0.0)
@@ -236,9 +237,14 @@ def make_step2_chart(
     )
     return {
         "avg_monthly_pnl": avg_pnl,
+        "median_monthly_pnl": med_pnl,
         "avg_monthly_trades": avg_tpm,
         "positive_month_rate": pos_rate,
         "end_equity": end_eq,
+        "cagr": cagr,
+        "max_drawdown": mdd,
+        "calmar": (float(calmar) if calmar is not None else None),
+        "total_trades": total_trades,
     }
 
 
@@ -256,6 +262,7 @@ def make_step3_chart(
     avg_pnl = float(p.get("avg_monthly_pnl") or 0.0)
     med_pnl = float(p.get("median_monthly_pnl") or 0.0)
     avg_tpm = float(p.get("avg_monthly_trades") or 0.0)
+    total_trades = int(p.get("total_trades") or 0)
     if "monthly_positive_rate" in p:
         pos_rate = float(p.get("monthly_positive_rate") or 0.0)
     else:
@@ -342,11 +349,20 @@ def make_step3_chart(
     )
     return {
         "avg_monthly_pnl": avg_pnl,
+        "median_monthly_pnl": med_pnl,
         "avg_monthly_trades": avg_tpm,
         "positive_month_rate": pos_rate,
         "end_equity": end_eq,
-        "stress_1_25_avg_monthly_pnl": (float(stress_125.get("avg_monthly_pnl")) if stress_125 else None),
-        "stress_1_50_avg_monthly_pnl": (float(stress_150.get("avg_monthly_pnl")) if stress_150 else None),
+        "cagr": cagr,
+        "max_drawdown": mdd,
+        "calmar": (float(calmar) if calmar is not None else None),
+        "total_trades": total_trades,
+        "stress_1_25_avg_monthly_pnl": (
+            float(stress_125.get("avg_monthly_pnl")) if (stress_125 and stress_125.get("avg_monthly_pnl") is not None) else None
+        ),
+        "stress_1_50_avg_monthly_pnl": (
+            float(stress_150.get("avg_monthly_pnl")) if (stress_150 and stress_150.get("avg_monthly_pnl") is not None) else None
+        ),
         "bootstrap_p10_avg_monthly_pnl": (
             float((boot.get("avg_monthly_pnl") or {}).get("p10")) if bool(boot.get("enabled")) else None
         ),
@@ -379,6 +395,12 @@ def main() -> None:
     ap.add_argument("--step3-max-candidates", type=int, default=6)
     ap.add_argument("--step3-dd-cap", type=float, default=0.12)
     ap.add_argument("--step3-min-trades-month", type=float, default=6.0)
+    ap.add_argument(
+        "--same-bar-policy",
+        choices=["worst", "best", "close_direction"],
+        default="worst",
+        help="Same-bar TP/SL ambiguity policy for Step 2 and Step 3 dataset builds.",
+    )
     ap.add_argument("--pair-tag", default="spy_qqq", help="Slug used in exported chart filenames.")
     ap.add_argument("--display-symbol-1", default="SPY", help="Display symbol used for chart/report labels.")
     ap.add_argument("--display-symbol-2", default="QQQ", help="Display symbol used for chart/report labels.")
@@ -436,6 +458,8 @@ def main() -> None:
             "QQQ",
             "--trade-symbol",
             "QQQ",
+            "--same-bar-policy",
+            args.same_bar_policy,
         ]
         try:
             run_cmd(step2_cmd, cwd=str(repo_root))
@@ -462,6 +486,8 @@ def main() -> None:
                 str((repo_root / args.data_dir).resolve()),
                 "--out-dir",
                 str(step3_out),
+                "--same-bar-policy",
+                args.same_bar_policy,
             ],
             cwd=str(repo_root),
         )

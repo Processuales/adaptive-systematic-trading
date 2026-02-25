@@ -20,7 +20,7 @@ from typing import Dict, List
 
 import numpy as np
 
-SCRIPT_VERSION = "2.5.0"
+SCRIPT_VERSION = "2.6.0"
 
 
 def ensure_dir(path: str) -> None:
@@ -383,6 +383,10 @@ def run_cfg(
     cfg: Dict,
     crypto_mode: bool = False,
 ) -> Dict:
+    # Crypto q10 predictions are materially left-shifted after costs; an overly
+    # strict tail gate can collapse trade flow to zero.
+    tail_q10_default = -0.015 if bool(crypto_mode) else -0.02
+    tail_agg_q10_default = -0.010 if bool(crypto_mode) else -0.02
     cmd = [
         py,
         str(repo_root / "step3_train_and_backtest.py"),
@@ -474,6 +478,10 @@ def run_cfg(
         str(cfg.get("pattern_prob_max_abs_delta", 0.04)),
         "--pattern-ret-max-abs-delta",
         str(cfg.get("pattern_ret_max_abs_delta", 0.0035)),
+        "--tail-q10-cut",
+        str(cfg.get("tail_q10_cut", tail_q10_default)),
+        "--tail-agg-q10-cut",
+        str(cfg.get("tail_agg_q10_cut", tail_agg_q10_default)),
         "--cost-stress-multipliers",
         str(cfg.get("cost_stress_multipliers", "1.25,1.50")),
         "--bootstrap-samples",

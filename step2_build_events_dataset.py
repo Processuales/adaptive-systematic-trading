@@ -46,7 +46,7 @@ import numpy as np
 import pandas as pd
 
 NY_TZ = "America/New_York"
-SCRIPT_VERSION = "2.1.0"
+SCRIPT_VERSION = "2.2.0"
 
 
 # -----------------------------
@@ -244,6 +244,60 @@ def map_features_from_t_idx(events: pd.DataFrame, source: pd.DataFrame, cols: Li
     return out
 
 
+def infer_median_bar_minutes(ts: pd.Series) -> float:
+    d = pd.to_datetime(ts, utc=True, errors="coerce").dropna().sort_values()
+    if len(d) < 3:
+        return float("nan")
+    mins = d.diff().dt.total_seconds().div(60.0).dropna()
+    mins = mins[mins > 0.0]
+    if mins.empty:
+        return float("nan")
+    return float(mins.median())
+
+
+def cross_alignment_diagnostics(
+    merged: pd.DataFrame,
+    cross_symbol: str,
+    tolerance: pd.Timedelta,
+) -> Dict[str, float]:
+    cross_ts_col = f"{cross_symbol.lower()}_date"
+    age_col = f"{cross_symbol.lower()}_age_min"
+    out: Dict[str, float] = {}
+    if cross_ts_col not in merged.columns or age_col not in merged.columns:
+        return out
+
+    n = int(len(merged))
+    age = pd.to_numeric(merged[age_col], errors="coerce")
+    matched = age.notna()
+    n_match = int(matched.sum())
+
+    med_bar_min = infer_median_bar_minutes(merged["date"])
+    tol_min = float(tolerance.total_seconds() / 60.0)
+    stale_bar_thr = med_bar_min if np.isfinite(med_bar_min) else tol_min
+
+    neg_age = int((age < 0.0).sum())
+    stale_tol = int((age > tol_min).sum())
+    stale_bar = int((age > stale_bar_thr).sum()) if np.isfinite(stale_bar_thr) else 0
+
+    out = {
+        "rows": n,
+        "matched_rows": n_match,
+        "match_rate": float(n_match / n) if n > 0 else 0.0,
+        "lookahead_count": neg_age,
+        "lookahead_rate": float(neg_age / n) if n > 0 else 0.0,
+        "stale_over_tolerance_count": stale_tol,
+        "stale_over_tolerance_rate": float(stale_tol / n) if n > 0 else 0.0,
+        "stale_over_bar_count": stale_bar,
+        "stale_over_bar_rate": float(stale_bar / n) if n > 0 else 0.0,
+        "age_p50_min": float(age.quantile(0.50)) if n_match > 0 else np.nan,
+        "age_p95_min": float(age.quantile(0.95)) if n_match > 0 else np.nan,
+        "age_p99_min": float(age.quantile(0.99)) if n_match > 0 else np.nan,
+        "median_bar_minutes": med_bar_min,
+        "merge_tolerance_minutes": tol_min,
+    }
+    return out
+
+
 def compute_gap_stats_event_window(
     out: pd.DataFrame,
     knobs: Knobs,
@@ -386,9 +440,14 @@ def build_cross_features(
         "r_cc",
         "sigma",
         "u_atr",
+        "sigma_prank",
+        "u_atr_prank",
         "trend_score",
         "pullback_z",
         "vol_z",
+        "gap_sd",
+        "gap_tail",
+        "intraday_tail_frac",
         "dist_to_hi",
         "range_ratio",
         "ema_fast_slope",
@@ -927,6 +986,7 @@ def main() -> None:
 
     # Optional cross-asset merge
     cross_cols_added: List[str] = []
+    cross_diag: Dict[str, float] = {}
     if knobs.include_cross_asset:
         cross_sym = knobs.cross_symbol.upper()
         if cross_sym not in bars_by_sym:
@@ -934,24 +994,27 @@ def main() -> None:
 
         print(f"[CROSS] merge_asof {cross_sym} into {trade_sym} (tolerance={tol})")
         trade_bars = build_cross_features(trade_bars, bars_by_sym[cross_sym], cross_sym, tol)
+        cross_diag = cross_alignment_diagnostics(trade_bars, cross_sym, tol)
 
         # record which cross columns exist (for later mapping into events)
         cross_cols_added = [c for c in trade_bars.columns if c.startswith(f"{cross_sym.lower()}_")] + [
             "rs_log", "ret_spread", "beta_proxy", "regime_agree"
         ]
 
-        # quick sanity: percent non-null in one key cross column
-        key_col = f"{cross_sym.lower()}_trend_score"
-        if key_col in trade_bars.columns:
-            pct = 100.0 * trade_bars[key_col].notna().mean()
-            print(f"[CROSS] {key_col} non-null: {pct:.2f}%")
-            if pct < 95.0:
-                print("[CROSS] WARN: cross alignment appears imperfect. Consider increasing --cross-tolerance.")
-        age_col = f"{cross_sym.lower()}_age_min"
-        if age_col in trade_bars.columns:
-            age = trade_bars[age_col].dropna()
-            if not age.empty:
-                print(f"[CROSS] {age_col} p99: {age.quantile(0.99):.2f} minutes")
+        if cross_diag:
+            print(
+                "[CROSS] match_rate="
+                f"{100.0 * float(cross_diag.get('match_rate') or 0.0):.2f}% "
+                f"lookahead_rate={100.0 * float(cross_diag.get('lookahead_rate') or 0.0):.4f}% "
+                f"stale_over_bar_rate={100.0 * float(cross_diag.get('stale_over_bar_rate') or 0.0):.2f}% "
+                f"age_p99={float(cross_diag.get('age_p99_min') or 0.0):.2f}m"
+            )
+            if float(cross_diag.get("match_rate") or 0.0) < 0.95:
+                print("[CROSS] WARN: low cross match rate (<95%). Check data overlap or increase --cross-tolerance.")
+            if float(cross_diag.get("lookahead_count") or 0.0) > 0.0:
+                print("[CROSS] WARN: negative cross ages found (potential lookahead).")
+            if float(cross_diag.get("stale_over_bar_rate") or 0.0) > 0.05:
+                print("[CROSS] WARN: stale cross joins >5% (age > median bar length).")
 
     # Build events dataset
     print(f"[EVENTS] building events for {trade_sym}")
@@ -968,9 +1031,14 @@ def main() -> None:
         desired = [
             f"{cross_sym_l}_sigma",
             f"{cross_sym_l}_u_atr",
+            f"{cross_sym_l}_sigma_prank",
+            f"{cross_sym_l}_u_atr_prank",
             f"{cross_sym_l}_trend_score",
             f"{cross_sym_l}_pullback_z",
             f"{cross_sym_l}_vol_z",
+            f"{cross_sym_l}_gap_sd",
+            f"{cross_sym_l}_gap_tail",
+            f"{cross_sym_l}_intraday_tail_frac",
             f"{cross_sym_l}_range_ratio",
             f"{cross_sym_l}_ema_fast_slope",
             f"{cross_sym_l}_age_min",
@@ -1021,6 +1089,7 @@ def main() -> None:
             "bar_features_dir": out_bar,
             "events_path": out_events_path,
         },
+        "cross_alignment": cross_diag,
         "events_summary": summarize_events_for_meta(events),
     }
     out_meta_path = os.path.join(out_meta, "step2_config.json")

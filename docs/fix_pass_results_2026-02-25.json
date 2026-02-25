@@ -1,0 +1,74 @@
+﻿{
+    "generated_utc":  "2026-02-25T06:59:50.4414655Z",
+    "baseline_ref_utc":  "2026-02-24T22:09:53.804323Z",
+    "changes":  {
+                    "spyqqq":  {
+                                   "previous":  {
+                                                    "avg_monthly_pnl":  76.193111,
+                                                    "max_drawdown":  0.105611,
+                                                    "calmar":  0.671465,
+                                                    "avg_monthly_trades":  7.154639
+                                                },
+                                   "current":  {
+                                                   "generated_utc":  "2026-02-25T00:28:15.110102+00:00",
+                                                   "avg_monthly_pnl":  74.180121,
+                                                   "max_drawdown":  0.120407,
+                                                   "calmar":  0.576529,
+                                                   "avg_monthly_trades":  7.134021,
+                                                   "total_trades":  692
+                                               },
+                                   "delta":  {
+                                                 "avg_monthly_pnl":  -2.0129900000000021,
+                                                 "max_drawdown":  0.014796000000000004,
+                                                 "calmar":  -0.09493600000000002,
+                                                 "avg_monthly_trades":  -0.020618000000000691
+                                             }
+                               },
+                    "btceth":  {
+                                   "previous":  {
+                                                    "avg_monthly_pnl":  146.624268,
+                                                    "max_drawdown":  0.208737,
+                                                    "calmar":  0.564077,
+                                                    "avg_monthly_trades":  0
+                                                },
+                                   "current":  {
+                                                   "generated_utc":  "2026-02-25T06:58:54.797104+00:00",
+                                                   "avg_monthly_pnl":  539.797,
+                                                   "max_drawdown":  0.322384,
+                                                   "calmar":  0.807148,
+                                                   "avg_monthly_trades":  16.305263,
+                                                   "total_trades":  1549
+                                               },
+                                   "delta":  {
+                                                 "avg_monthly_pnl":  393.172732,
+                                                 "max_drawdown":  0.113647,
+                                                 "calmar":  0.24307099999999993,
+                                                 "avg_monthly_trades":  16.305263
+                                             },
+                                   "hybrid_overlay":  {
+                                                          "generated_utc":  "2026-02-25T06:58:42.908773+00:00",
+                                                          "baseline_source":  "backtest_active_baseline",
+                                                          "baseline_source_rejections":  [
+                                                                                             "tilt_best_candidate: superseded by backtest_active_baseline (-15.7972 -\u003e 532.7655)"
+                                                                                         ],
+                                                          "promoted":  false,
+                                                          "promoted_from":  "active_baseline",
+                                                          "best_candidate":  "hybrid_core0_85_btc0_70_active0_15_trend_guard_6m",
+                                                          "best_candidate_metrics":  {
+                                                                                         "avg_monthly_pnl":  1249.683854,
+                                                                                         "median_monthly_pnl":  446.676094,
+                                                                                         "avg_monthly_trades":  16.305263,
+                                                                                         "monthly_positive_rate":  0.547368,
+                                                                                         "monthly_negative_rate":  0.452632,
+                                                                                         "end_equity":  128719.966091,
+                                                                                         "cagr":  0.385365,
+                                                                                         "max_drawdown":  0.638288,
+                                                                                         "calmar":  0.603747,
+                                                                                         "stress_1_25_avg_monthly_pnl":  1178.918972,
+                                                                                         "stress_1_50_avg_monthly_pnl":  1144.396006,
+                                                                                         "bootstrap_p10_avg_monthly_pnl":  -81.490889
+                                                                                     }
+                                                      }
+                               }
+                }
+}

@@ -38,6 +38,12 @@ def main() -> None:
     ap.add_argument("--start-capital", type=float, default=10000.0, help="Start capital for visuals")
     ap.add_argument("--symbols", nargs="+", default=["SPY", "QQQ"], help="Symbols for Step 2 build")
     ap.add_argument("--trade-symbol", default="QQQ", help="Primary trade symbol for Step 2 build outputs")
+    ap.add_argument(
+        "--same-bar-policy",
+        choices=["worst", "best", "close_direction"],
+        default="worst",
+        help="Same-bar TP/SL ambiguity policy (default: worst for conservative labeling).",
+    )
     args = ap.parse_args()
 
     repo_root = Path(__file__).resolve().parent
@@ -64,6 +70,8 @@ def main() -> None:
             *[s.upper() for s in args.symbols],
             "--trade-symbol",
             args.trade_symbol.upper(),
+            "--same-bar-policy",
+            args.same_bar_policy,
         ],
         cwd=str(repo_root),
     )

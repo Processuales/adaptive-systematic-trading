@@ -251,6 +251,29 @@ def top_correlations(df: pd.DataFrame, target: str, limit: int, exclude: set[str
     return out
 
 
+def cross_alignment_summary(df: pd.DataFrame) -> List[Dict]:
+    rows: List[Dict] = []
+    age_cols = [c for c in df.columns if c.endswith("_age_min")]
+    for c in sorted(age_cols):
+        age = pd.to_numeric(df[c], errors="coerce")
+        n = int(len(age))
+        n_ok = int(age.notna().sum())
+        if n <= 0:
+            continue
+        rows.append(
+            {
+                "age_col": c,
+                "match_rate": float(n_ok / n),
+                "lookahead_rate": float((age < 0.0).sum() / n),
+                "age_p50_min": float(age.quantile(0.50)) if n_ok > 0 else None,
+                "age_p95_min": float(age.quantile(0.95)) if n_ok > 0 else None,
+                "age_p99_min": float(age.quantile(0.99)) if n_ok > 0 else None,
+                "stale_gt_60m_rate": float((age > 60.0).sum() / n),
+            }
+        )
+    return rows
+
+
 def plot_equity(df: pd.DataFrame, out_path: str) -> None:
     x = df["decision_time_utc"]
     gross = df["gross_logret"].cumsum()
@@ -462,6 +485,7 @@ def build_summary(df: pd.DataFrame, bar_features_path: str | None, corr_limit: i
         "data_quality": {
             "top_nan_rates": nan_rates.to_dict(orient="records"),
             "cross_nan_rates": cross_nan,
+            "cross_alignment": cross_alignment_summary(df),
             "sanity_flags": sanity_flags,
             "bar_context": bar_context,
         },

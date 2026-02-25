@@ -1,0 +1,18 @@
+{
+  "spyqqq": {
+    "avg_monthly_pnl": 90.772636,
+    "end_equity": 18804.945709,
+    "max_drawdown": 0.129601,
+    "calmar": 0.628656,
+    "avg_monthly_trades": 7.123711,
+    "monthly_positive_rate": 0.546392
+  },
+  "btceth": {
+    "avg_monthly_pnl": 163.66664,
+    "end_equity": 24729.997576,
+    "max_drawdown": 0.196508,
+    "calmar": 0.660489,
+    "avg_monthly_trades": 2.688889,
+    "monthly_positive_rate": 0.566667
+  }
+}

@@ -1,0 +1,139 @@
+{
+  "generated_utc": "2026-02-24T22:09:53.804323Z",
+  "before": {
+    "spyqqq": {
+      "avg_monthly_pnl": 90.772636,
+      "end_equity": 18804.945709,
+      "max_drawdown": 0.129601,
+      "calmar": 0.628656,
+      "avg_monthly_trades": 7.123711,
+      "monthly_positive_rate": 0.546392
+    },
+    "btceth": {
+      "avg_monthly_pnl": 163.66664,
+      "end_equity": 24729.997576,
+      "max_drawdown": 0.196508,
+      "calmar": 0.660489,
+      "avg_monthly_trades": 2.688889,
+      "monthly_positive_rate": 0.566667
+    }
+  },
+  "after": {
+    "spyqqq": {
+      "avg_monthly_pnl": 76.193111,
+      "end_equity": 17390.731782,
+      "max_drawdown": 0.105611,
+      "calmar": 0.671465,
+      "avg_monthly_trades": 7.154639,
+      "monthly_positive_rate": 0.556701,
+      "tail_gate_pass_rate_q_alias": 0.982956,
+      "tail_gate_pass_rate_s_alias": 1.0
+    },
+    "btceth": {
+      "avg_monthly_pnl": 146.624268,
+      "end_equity": 23929.305416,
+      "max_drawdown": 0.208737,
+      "calmar": 0.564077,
+      "avg_monthly_trades": 0.0,
+      "monthly_positive_rate": 0.536842,
+      "tail_gate_pass_rate_q_alias": 0.000277,
+      "tail_gate_pass_rate_s_alias": 0.0
+    }
+  },
+  "delta": {
+    "spyqqq": {
+      "avg_monthly_pnl": -14.579525,
+      "avg_monthly_trades": 0.030928,
+      "calmar": 0.042809,
+      "end_equity": -1414.213927,
+      "max_drawdown": -0.02399,
+      "monthly_positive_rate": 0.010309,
+      "tail_gate_pass_rate_q_alias": null,
+      "tail_gate_pass_rate_s_alias": null
+    },
+    "btceth": {
+      "avg_monthly_pnl": -17.042372,
+      "avg_monthly_trades": -2.688889,
+      "calmar": -0.096412,
+      "end_equity": -800.69216,
+      "max_drawdown": 0.012229,
+      "monthly_positive_rate": -0.029825,
+      "tail_gate_pass_rate_q_alias": null,
+      "tail_gate_pass_rate_s_alias": null
+    }
+  },
+  "cross_alignment": {
+    "spyqqq": {
+      "qqq_from_spy": {
+        "rows": 17647,
+        "matched_rows": 17647,
+        "match_rate": 1.0,
+        "lookahead_count": 0,
+        "lookahead_rate": 0.0,
+        "stale_over_tolerance_count": 0,
+        "stale_over_tolerance_rate": 0.0,
+        "stale_over_bar_count": 0,
+        "stale_over_bar_rate": 0.0,
+        "age_p50_min": 0.0,
+        "age_p95_min": 0.0,
+        "age_p99_min": 0.0,
+        "median_bar_minutes": 60.0,
+        "merge_tolerance_minutes": 30.0
+      },
+      "spy_from_qqq": {
+        "rows": 17654,
+        "matched_rows": 17647,
+        "match_rate": 0.999603,
+        "lookahead_count": 0,
+        "lookahead_rate": 0.0,
+        "stale_over_tolerance_count": 0,
+        "stale_over_tolerance_rate": 0.0,
+        "stale_over_bar_count": 0,
+        "stale_over_bar_rate": 0.0,
+        "age_p50_min": 0.0,
+        "age_p95_min": 0.0,
+        "age_p99_min": 0.0,
+        "median_bar_minutes": 60.0,
+        "merge_tolerance_minutes": 30.0
+      }
+    },
+    "btceth": {
+      "qqq_from_spy": {
+        "rows": 74526,
+        "matched_rows": 74526,
+        "match_rate": 1.0,
+        "lookahead_count": 0,
+        "lookahead_rate": 0.0,
+        "stale_over_tolerance_count": 0,
+        "stale_over_tolerance_rate": 0.0,
+        "stale_over_bar_count": 0,
+        "stale_over_bar_rate": 0.0,
+        "age_p50_min": 0.0,
+        "age_p95_min": 0.0,
+        "age_p99_min": 0.0,
+        "median_bar_minutes": 60.0,
+        "merge_tolerance_minutes": 30.0
+      },
+      "spy_from_qqq": {
+        "rows": 74526,
+        "matched_rows": 74526,
+        "match_rate": 1.0,
+        "lookahead_count": 0,
+        "lookahead_rate": 0.0,
+        "stale_over_tolerance_count": 0,
+        "stale_over_tolerance_rate": 0.0,
+        "stale_over_bar_count": 0,
+        "stale_over_bar_rate": 0.0,
+        "age_p50_min": 0.0,
+        "age_p95_min": 0.0,
+        "age_p99_min": 0.0,
+        "median_bar_minutes": 60.0,
+        "merge_tolerance_minutes": 30.0
+      }
+    }
+  },
+  "focused_search": {
+    "spyqqq_report": "c:\\dev\\Coding\\Trader\\adaptive-systematic-trading\\focused_runs\\spyqqq\\focused_report.json",
+    "btceth_active_report": "c:\\dev\\Coding\\Trader\\adaptive-systematic-trading\\other-pair\\btc_eth\\focused_runs\\active\\focused_report.json"
+  }
+}
